@@ -465,8 +465,8 @@ def _recover_format_errors(
     messages: list[dict[str, Any]], api_messages: Any,
 ) -> bool:
     """One-shot format-recovery strips: thinking-signature → invalid-encrypted-content
-    replay disable → native-compaction reject → llama.cpp grammar strip. Returns True when
-    the request was repaired and should be retried."""
+    replay disable → native-compaction reject → llama.cpp grammar strip → malformed
+    tool-call JSON re-ask. Returns True when the request was repaired and should be retried."""
     # Upstream mutation can invalidate a thinking signature. Native Anthropic has multiple replay
     # carriers and preserved historical blocks, so suppress the rejected opaque blocks across all
     # carriers and persist that suppression. Other transports keep their established one-request
@@ -554,7 +554,64 @@ def _recover_format_errors(
             "keywords to strip — falling through to normal retry",
             agent.log_prefix,
         )
+
+    # FORK: ollama.com (and OpenRouter-wrapped routes) validate tool-call JSON server-side and
+    # answer a bare 400 ``invalid tool call arguments`` when the MODEL's own emission is broken.
+    # The verdict is right that no provider switch helps, but a hard stop is wrong twice over:
+    # the emission is stochastic (replaying the identical body returns 200), and a genuinely
+    # corrupt replayed argument can still be repaired on the wire copy. Repair, then re-ask the
+    # same route once; a second miss settles the original error as before.
+    if _is_malformed_tool_args_error(api_error) and not _retry.malformed_tool_args_retry_attempted:
+        _retry.malformed_tool_args_retry_attempted = True
+        repaired = 0
+        try:
+            from agent.conversation_loop import _canonicalize_api_tool_calls
+
+            before = _invalid_tool_call_arg_count(api_messages)
+            _canonicalize_api_tool_calls(api_messages)
+            repaired = before - _invalid_tool_call_arg_count(api_messages)
+        except Exception:  # pragma: no cover — defensive; a clean retry still helps
+            logger.debug("%sMalformed tool-call args: wire repair failed", agent.log_prefix, exc_info=True)
+        _vlines(agent, "🔁 The model emitted a malformed tool call — re-asking the same route...")
+        logger.warning(
+            "%sMalformed tool-call arguments 400 on %s/%s (%d replayed argument(s) repaired); "
+            "retrying the same route once",
+            agent.log_prefix, getattr(agent, "provider", "?"), getattr(agent, "model", "?"), repaired,
+        )
+        return True
     return False
+
+
+def _is_malformed_tool_args_error(api_error: Exception) -> bool:
+    """True when the provider rejected the model's own tool-call JSON (Ollama wording).
+
+    The classifier maps this to ``format_error`` with no fallback — correct, since another
+    provider cannot fix this model's output — but the reason string is the only place the
+    wording survives, so the recovery rung matches it again here.
+    """
+    from agent.error_classifier import _MALFORMED_TOOL_ARGS_PATTERNS
+
+    text = str(api_error or "").lower()
+    return any(pattern in text for pattern in _MALFORMED_TOOL_ARGS_PATTERNS)
+
+
+def _invalid_tool_call_arg_count(api_messages: Any) -> int:
+    """Count replayed ``tool_calls[].function.arguments`` that are not valid JSON."""
+    import json
+
+    total = 0
+    for message in api_messages or ():
+        if not isinstance(message, dict):
+            continue
+        for tool_call in message.get("tool_calls") or ():
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            arguments = function.get("arguments") if isinstance(function, dict) else None
+            if isinstance(arguments, str) and arguments.strip():
+                try:
+                    json.loads(arguments)
+                except ValueError:
+                    total += 1
+    return total
 
 
 _WELCOME_ROUTE_HEAL_COPY = {

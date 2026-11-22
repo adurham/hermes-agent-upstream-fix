@@ -76,6 +76,49 @@ def test_client_error_settlement_skips_fallback_when_classifier_says_so():
     assert agent.activated == []
 
 
+def test_malformed_tool_args_repairs_the_wire_copy_and_reasks_once():
+    """FORK: the model's own bad tool-call JSON is stochastic (the same body can 400 then 200),
+    so the no-fallback verdict still gets one same-route re-ask with the replayed arguments
+    repaired — never a provider switch, and never a loop."""
+    from agent.turn_recovery import _recover_format_errors
+    from agent.turn_retry_state import TurnRetryState
+
+    agent = _Agent()
+    agent.model = "deepseek-v4.1-flash:1017"
+    bad_args = '{"content":"build caab2fa1f8 \\uZZZZ done"}'
+    api_messages = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": bad_args}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    retry = TurnRetryState()
+    err = _Err("Error code: 400 - {'error': {'message': 'invalid tool call arguments (ref: abc)'}}")
+    classified = classify_api_error(err, provider="ollama")
+
+    assert classified.reason is FailoverReason.format_error
+    assert classified.should_fallback is False
+
+    assert _recover_format_errors(agent, err, classified, retry, [], api_messages) is True
+    # The wire copy is healed; canonical history is never touched here.
+    assert api_messages[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert retry.malformed_tool_args_retry_attempted is True
+
+    # One-shot: the second miss settles the error instead of re-asking.
+    assert _recover_format_errors(agent, err, classified, retry, [], api_messages) is False
+
+
+def test_unrelated_format_errors_are_not_retried_by_the_malformed_rung():
+    from agent.turn_recovery import _recover_format_errors
+    from agent.turn_retry_state import TurnRetryState
+
+    agent = _Agent()
+    err = _Err("Unsupported parameter: 'max_tokens'")
+    classified = classify_api_error(err, provider="ollama")
+    retry = TurnRetryState()
+    assert _recover_format_errors(agent, err, classified, retry, [], []) is False
+    assert retry.malformed_tool_args_retry_attempted is False
+
+
 def test_fallback_free_verdict_wins_over_local_valueerror_shape():
     """A recognised no-fallback verdict raised as a ValueError subclass (MoA preset missing,
     #55933) must not sneak through the unclassified-local-error fallback allowance; a truly

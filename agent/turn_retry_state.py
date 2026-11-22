@@ -41,6 +41,9 @@ class TurnRetryState:
     reasoning_mandatory_retry_visit: int | None = None
     oauth_1m_beta_retry_attempted: bool = False
     llama_cpp_grammar_retry_attempted: bool = False
+    # Provider rejected the model's own tool-call JSON (Ollama 400 "invalid tool call
+    # arguments"): the emission is stochastic, so repair the wire copy and re-ask once.
+    malformed_tool_args_retry_attempted: bool = False
 
     # Transport / rate-limit recovery
     primary_recovery_attempted: bool = False
