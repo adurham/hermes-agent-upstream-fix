@@ -424,6 +424,13 @@ class ClientLifecycleMixin:
         try:
             # Non-HTTP providers cancel without closing owner-thread file descriptors.
             if callable(getattr(type(client), "cancel", None)):
+                # FORK: log it. This branch was silent, so a process-backed provider (the Claude
+                # subscription SDK) dying as 'Claude request cancelled' left no record of which
+                # host path cancelled it and why.
+                logger.info(
+                    "%s client cancelled (%s, shared=False, deferred_close=stranger_thread) %s",
+                    label, reason, context,
+                )
                 client.cancel()
                 return
             shutdown_count = self._force_close_tcp_sockets(client)
