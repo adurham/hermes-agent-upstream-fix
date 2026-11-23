@@ -9,15 +9,51 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only fix — 2026-11-23 (desktop exit): a restart killed live turns instead of pausing them
+
+**Symptom.** Every backend restart or update cut whatever chat was mid-turn. Owner, twice: "when the gateway restarts it is
+killing running sessions. I want them paused and gracefully resumed" and "I want live work/in progress sessions to
+gracefully pause and restart!".
+
+**Root cause.** `tui_gateway/session_reaper.py::_stop_turns_before_exit` interrupts every running turn the moment SIGTERM
+lands and gives it `_EXIT_TURN_SETTLE_S` (0.5 s) to settle — enough to persist a tool result, never enough to finish a
+turn. Two supervisors made any wait impossible anyway: `hermes-desktop-serve.service` had `TimeoutStopSec=20`, and
+`hermes_cli/dashboard_procs.py::_POSIX_TERM_GRACE_SECONDS` (the updater's stop) waited 10 s before SIGKILL. So a restart
+was always "kill now"; the only recovery was the resume marker, which the owner had to trigger by reopening the chat.
+
+**Fix.** The shutdown drains before it interrupts. `_await_running_turns(budget)` polls the live session map and returns
+once nothing is `running`, or when the budget is spent — then `_stop_turns_before_exit` runs exactly as before. Budget is
+`desktop.exit_drain_seconds` (default **900**, env `HERMES_TUI_EXIT_DRAIN_S`, `0` disables). It is wired into both exit
+paths: `_handle_exit_flush_signal` (uvicorn's SIGTERM, the dashboard/desktop backend) and `server._shutdown_sessions`
+(atexit / the TUI entry). Both supervisors now outlast it: `dashboard_procs._stop_grace_seconds()` computes the
+SIGTERM→SIGKILL grace from the same budget (+30 s), and the unit's `TimeoutStopSec` is raised to 1000 s by a drop-in.
+
+**Files.** `tui_gateway/session_reaper.py` (`_exit_drain_budget`, `_await_running_turns`, the drain call in
+`_handle_exit_flush_signal`), `tui_gateway/server.py` (`_shutdown_sessions`), `hermes_cli/dashboard_procs.py`
+(`_stop_grace_seconds`); tests `tests/tui_gateway/test_exit_drain.py` (6: idle returns at once, a finishing turn is waited
+for, the budget is honoured, 0 disables, env/config resolution, the stop grace outlasts the drain).
+
+**Evidence.** `tests/tui_gateway/test_exit_drain.py` 6 passed; the exit/flush/shutdown selection across
+`tests/tui_gateway` 757 passed, 1 error — a conftest import-order artifact
+(`notification_park ... partially initialized module`) that passes when that file runs alone and is unrelated to this
+change.
+
+**Deploy.** Code takes effect on the next backend restart — the first restart after this commit is still the old
+behaviour. **Host requirement:** `~/.config/systemd/user/hermes-desktop-serve.service.d/50-graceful-exit.conf` with
+`TimeoutStopSec=1000` must exist (the repo cannot ship a unit drop-in), then `systemctl --user daemon-reload`.
+
+**Limit.** A turn longer than the budget is still interrupted at the deadline (that is the point of the deadline); the
+marker/auto-continue path then resumes it. This is a *drain*, not a mid-turn checkpoint.
+
 ### Fork-only config — 2026-11-23 (desktop auto-continue): a restart-interrupted turn expired after 15 minutes, so the owner kept retyping "pick this back up"
 
 **Symptom.** Every restart of the desktop backend killed the running chats and nothing picked them up: the owner reopened
 the vent-controller chat hours later and had to type "pick this back up". Owner: "when the gateway restarts it is killing
 running sessions. I want them paused and gracefully resumed so I don't have to keep telling things to pick this back up."
 
-**Root cause.** Two halves, one of them correct. (1) The interrupt is deliberate: `tui_gateway/session_reaper.py::_
-stop_turns_before_exit` interrupts every in-flight turn on shutdown and gives it a short settle budget — a process cannot
-keep serving turns while it exits. (2) The recovery existed but had a 15-minute shelf life. `tui_gateway/turn_marker.py`
+**Root cause.** Two halves, one of them correct. (1) At the time, the interrupt was immediate — the shutdown now drains
+in-flight turns first (the exit-drain entry above); before that it cut every running turn on the way out. (2) The recovery
+existed but had a 15-minute shelf life. `tui_gateway/turn_marker.py`
 writes a durable marker (original prompt + writer pid/start time) at turn start and clears it on any conclusion the client
 saw; only a process death leaves one behind, and `_maybe_schedule_auto_continue` re-submits it on session resume with a
 "some of the work may already be complete — check state, then finish" note. But `desktop.auto_continue.freshness_minutes`
