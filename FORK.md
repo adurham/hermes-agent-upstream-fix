@@ -9,6 +9,41 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only fix — 2026-11-23 (gateway/kanban): a restart that waits for idle never converged — the dispatcher kept refilling every freed slot
+
+**Symptom.** `hermes gateway restart` (SIGUSR1) sat for 40+ minutes and never restarted. Every 300 s the log
+repeated `Restart still waiting after 2100s; live work is NOT interrupted (only a forced restart stops it)`,
+naming 8 managed workers. Owner: "needs to be as graceful as possible."
+
+**Root cause.** `gateway/restart_when_idle.py::await_idle` waits for zero in-flight units, but the embedded
+kanban dispatcher kept ticking and claiming ready cards every 60 s, so the in-flight set never reached zero:
+the worker count held at the cap while each finishing card was immediately replaced (16 → 13 during the wait,
+never 0). The levers that look like they should stop it do not: `_DispatcherSettings` is read once at boot
+("restart to apply"); `.drain_request.json` / `_enter_external_drain` refuses only new *messaging* turns; the
+dispatcher singleton lock is held for the process lifetime.
+
+**Fix.** A dispatch hold on the runner, latched the instant a restart is requested
+(`restart_when_idle.request_restart`) and while an external drain is engaged
+(`run_shutdown._enter_external_drain`, cleared by `_exit_external_drain` only for its own reason). The watcher
+keeps ticking — zombie reaping, stale-timeout enforcement, reclaims — but `tick_once(hold=True)` passes
+`max_spawn=0`, a live concurrency cap, so nothing is claimed and the in-flight set can only fall. Logged once
+per engagement: `kanban dispatcher: dispatch held (restart requested) — no new workers until the wait ends`.
+
+**Files.** `gateway/restart_when_idle.py`, `gateway/run_shutdown.py`, `gateway/run_runtime_init.py`,
+`gateway/kanban_watchers.py`, `gateway/kanban_watchers_dispatcher.py` (`tick_kwargs`, `tick_once(hold)`,
+`tick_once_for_board(hold)`); tests `tests/gateway/test_kanban_dispatch_hold.py` — the hold caps spawns at 0
+while keeping the rest of the tick, no hold keeps the configured cap, the hold reaches every board, and a
+restart request engages it.
+
+**Evidence.** Live: the restart carrying this change was requested with the lanes paused; the worker count fell
+monotonically and no card was spawned into the freed slots (before the fix the count stayed pinned at the cap
+with cards replacing each other). Tests: 6 passed (`test_kanban_dispatch_hold.py` + the notifier dispatch-gate
+suite).
+
+**Deploy.** Gateway-side, takes effect on the next restart. Before this the only exits from the livelock were
+SIGTERM on the managed workers (8 cards lost their turn; the dispatcher reclaimed and re-dispatched them) or a
+hard service restart.
+
 ### Fork-only fix — 2026-11-23 (desktop About): the backend panel named the CLIENT install's commit, then said the backend was current
 
 **Symptom.** The updates overlay in backend mode printed `Commit a4f3ae4fb8e7…` directly under "The
