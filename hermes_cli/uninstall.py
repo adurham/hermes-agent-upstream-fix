@@ -189,9 +189,28 @@ def remove_wrapper_script():
     return removed
 
 
-def _node_symlink_candidate_dirs() -> list[Path]:
-    """Directories where the installer may have placed node/npm/npx symlinks."""
-    dirs: list[Path] = [Path.home() / ".local" / "bin"]
+def _install_owner_home(hermes_home: Path) -> Path:
+    """The user home that owns *hermes_home* (``~/.hermes`` and its profiles → ``~``).
+
+    Resolved from the home being uninstalled, not from the ambient
+    ``Path.home()``: a redirected ``HERMES_HOME`` (test sandbox, per-task home,
+    second install) must never reach back into the real user's directory.
+    """
+    for candidate in (hermes_home, *hermes_home.parents):
+        if candidate.name == ".hermes":
+            return candidate.parent
+    return Path.home()
+
+
+def _node_symlink_candidate_dirs(hermes_home: Path | None = None) -> list[Path]:
+    """Directories where the installer may have placed node/npm/npx symlinks.
+
+    The user bin directory is derived from *hermes_home* when given, so
+    uninstalling a redirected or temporary Hermes home can never unlink the
+    operator's real ``~/.local/bin`` shims.
+    """
+    home = Path.home() if hermes_home is None else _install_owner_home(hermes_home)
+    dirs: list[Path] = [home / ".local" / "bin"]
     if sys.platform == "linux":  # root FHS installs put links in /usr/local/bin
         dirs.append(Path("/usr/local/bin"))
     return dirs
@@ -227,7 +246,7 @@ def remove_node_symlinks(hermes_home: Path) -> list:
         link.unlink()
         return True
 
-    candidates = (bin_dir / name for name in ("node", "npm", "npx") for bin_dir in _node_symlink_candidate_dirs())
+    candidates = (bin_dir / name for name in ("node", "npm", "npx") for bin_dir in _node_symlink_candidate_dirs(hermes_home))
     return _remove_each(candidates, _unlink_ours)
 
 

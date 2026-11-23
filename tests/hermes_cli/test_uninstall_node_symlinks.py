@@ -48,7 +48,7 @@ def test_node_link_cleanup_respects_resolved_owner(fake_home, monkeypatch, owned
         link.symlink_to(target)
     except OSError as exc:
         pytest.skip(f"native symlink creation unavailable: {exc}")
-    monkeypatch.setattr(uninstall, "_node_symlink_candidate_dirs", lambda: [link.parent])
+    monkeypatch.setattr(uninstall, "_node_symlink_candidate_dirs", lambda home=None: [link.parent])
     removed = uninstall.remove_node_symlinks(home)
     assert removed == ([link] if owned else [])
     assert link.exists() is (not owned)
@@ -108,7 +108,7 @@ def test_removes_fhs_symlinks_in_usr_local_bin(fake_home, tmp_path, monkeypatch)
 
     # Return only our fake FHS dir as a candidate.
     monkeypatch.setattr(
-        uninstall, "_node_symlink_candidate_dirs", lambda: [fhs_bin]
+        uninstall, "_node_symlink_candidate_dirs", lambda home=None: [fhs_bin]
     )
 
     removed = uninstall.remove_node_symlinks(hermes_home)
@@ -116,3 +116,26 @@ def test_removes_fhs_symlinks_in_usr_local_bin(fake_home, tmp_path, monkeypatch)
     assert sorted(p.name for p in removed) == ["node", "npm", "npx"]
     for name in ("node", "npm", "npx"):
         assert not (fhs_bin / name).is_symlink()
+
+
+@pytest.mark.require_symlinks
+def test_candidate_dirs_follow_the_hermes_home_not_the_process_home(fake_home, tmp_path):
+    """A redirected HERMES_HOME must never point uninstall at the real ~/.local/bin.
+
+    Regression for the pytest sandbox leaking into the operator's real
+    ``~/.local/bin``: the shim directory is derived from the home being
+    uninstalled, so a temp install cannot unlink the user's own shims.
+    """
+    sandbox = tmp_path / "sandbox" / ".hermes"
+    sandbox.mkdir(parents=True)
+    dirs = uninstall._node_symlink_candidate_dirs(sandbox)
+    assert dirs[0] == tmp_path / "sandbox" / ".local" / "bin"
+    assert fake_home / ".local" / "bin" not in dirs
+
+
+@pytest.mark.require_symlinks
+def test_profile_home_still_resolves_to_the_owner_home(fake_home):
+    """A profile home (~/.hermes/profiles/x) maps back to its owner's ~/.local/bin."""
+    profile = fake_home / ".hermes" / "profiles" / "ps5-pm"
+    profile.mkdir(parents=True)
+    assert uninstall._node_symlink_candidate_dirs(profile)[0] == fake_home / ".local" / "bin"

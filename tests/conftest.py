@@ -1945,3 +1945,69 @@ def real_bash() -> str:
             if candidate.exists():
                 return str(candidate)
     return found or "bash"
+
+
+def _real_user_home() -> Path | None:
+    """The operator's home as the OS records it, immune to HOME / Path.home() patches.
+
+    Tests are allowed to redirect HOME (and several do), so a sandbox write that
+    resolves the home through the environment can silently land in the real
+    user's directory.  The password database is the one source a test cannot
+    monkeypatch.
+    """
+    try:
+        if os.name == "posix":
+            import pwd
+
+            return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        pass
+    return None
+
+
+def _local_bin_snapshot(bin_dir: Path) -> dict[str, str]:
+    """Names in *bin_dir* mapped to their link target (or ``"file"``)."""
+    snapshot: dict[str, str] = {}
+    try:
+        entries = list(bin_dir.iterdir())
+    except OSError:
+        return snapshot
+    for entry in entries:
+        try:
+            snapshot[entry.name] = os.readlink(entry) if entry.is_symlink() else "file"
+        except OSError:
+            snapshot[entry.name] = "unreadable"
+    return snapshot
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_local_bin_is_never_touched():
+    """Fail the run if any test creates, retargets or deletes a real ``~/.local/bin`` entry.
+
+    ``tests/conftest.py`` deliberately leaves HOME and ``Path.home()`` intact
+    (invariant 2), so a test that exercises an installer, uninstaller or shim
+    publisher can write into the operator's own bin directory.  That has
+    happened: a pytest sandbox left ``node``/``npm``/``npx`` symlinked into
+    ``/var/tmp/hermes-pytest/...``, silently shadowing the user's toolchain
+    long after the run.  Any such mutation now fails the session by name.
+    """
+    home = _real_user_home()
+    if home is None:
+        yield
+        return
+    bin_dir = home / ".local" / "bin"
+    before = _local_bin_snapshot(bin_dir)
+    yield
+    after = _local_bin_snapshot(bin_dir)
+    if before == after:
+        return
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    retargeted = sorted(name for name in set(before) & set(after) if before[name] != after[name])
+    pytest.exit(
+        "the test run modified the real "
+        f"{bin_dir}: added={added} removed={removed} retargeted={retargeted}. "
+        "A test wrote outside its sandbox — fix the code path to derive the bin "
+        "directory from the Hermes home under test, not Path.home().",
+        returncode=1,
+    )
