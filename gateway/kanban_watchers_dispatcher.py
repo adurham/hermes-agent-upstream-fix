@@ -172,17 +172,27 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
-    def tick_once_for_board(self, slug: str) -> Optional[object]:
+    def tick_kwargs(self, hold: bool = False) -> dict:
+        """``dispatch_once`` kwargs for this tick; a hold caps spawns at zero without
+        skipping the tick, so reaping, stale-timeout enforcement and reclaims keep running.
+        """
+        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        if hold:
+            kwargs["max_spawn"] = 0
+        return kwargs
+
+    def tick_once_for_board(self, slug: str, hold: bool = False) -> Optional[object]:
         """Run one dispatch_once for a specific board.
 
         The per-board DB is opened explicitly so boards never share a
-        connection or claim across each other.
+        connection or claim across each other. ``hold`` spawns no new workers
+        while a restart or external drain waits for in-flight work to finish.
         """
         conn = None
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        kwargs = self.tick_kwargs(hold)
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -212,9 +222,14 @@ class _KanbanDispatcher:
                 with contextlib.suppress(Exception):
                     conn.close()
 
-    def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+    def tick_once(self, hold: bool = False) -> list[tuple[str, Optional[object]]]:
+        """Run one dispatch_once per board. Returns (slug, result) pairs.
+
+        ``hold`` keeps the tick alive (reaping, stale timeouts, reclaims) while
+        spawning no new workers — used while a restart or external drain waits
+        for the in-flight set to reach zero.
+        """
+        return [(slug, self.tick_once_for_board(slug, hold)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?

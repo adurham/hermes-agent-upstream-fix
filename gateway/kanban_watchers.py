@@ -305,7 +305,20 @@ class GatewayKanbanWatchersMixin:
                     # See #49638.
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(dispatcher.tick_once)
+                    # Dispatch hold: a restart or external drain waits for in-flight work to reach
+                    # zero. Keep ticking (reaping, stale timeouts, reclaims) but spawn nothing, or
+                    # every freed slot is refilled and the wait never converges.
+                    hold = getattr(self, "_dispatch_hold", None)
+                    if hold and not getattr(self, "_dispatch_hold_logged", False):
+                        self._dispatch_hold_logged = True
+                        logger.info(
+                            "kanban dispatcher: dispatch held (%s) — no new workers until the "
+                            "wait ends; running workers finish normally",
+                            hold.get("reason") if isinstance(hold, dict) else hold,
+                        )
+                    elif not hold:
+                        self._dispatch_hold_logged = False
+                    results = await _to_thread_process_service(dispatcher.tick_once, bool(hold))
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0

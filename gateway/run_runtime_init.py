@@ -60,6 +60,11 @@ class GatewayRuntimeInitMixin:
         # External (NAS-driven) drain, distinct from one-way ``_draining``: set while ``.drain_request.json``
         # exists — NEW turns refused, process stays up, removing the marker reverts to ``running``.
         self._external_drain_active = False
+        # Dispatch hold: while set, the kanban dispatcher keeps ticking (reaping, stale timeouts,
+        # reclaims) but spawns nothing. A restart or external drain is waiting for the in-flight
+        # set to reach zero; a dispatcher that refills every freed slot never lets that happen.
+        self._dispatch_hold: Optional[dict] = None
+        self._dispatch_hold_logged = False
         # ``_signal_initiated_shutdown``: SIGTERM/SIGINT with no planned-stop/takeover marker (container,
         # OOM, bare kill); _stop_impl must NOT persist gateway_state=stopped or container_boot won't restart.
         self._restart_requested = self._signal_initiated_shutdown = self._restart_task_started = False

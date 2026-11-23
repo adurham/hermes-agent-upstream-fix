@@ -725,6 +725,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         if self._external_drain_active:
             return
         self._external_drain_active = True
+        # Also hold the kanban dispatcher: a drain that only refuses chat turns still has the
+        # dispatcher spawning workers, so the in-flight set never reaches zero.
+        self._dispatch_hold = {"reason": "external drain", "since": time.time()}
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
@@ -737,6 +740,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        _hold = getattr(self, "_dispatch_hold", None)
+        if isinstance(_hold, dict) and _hold.get("reason") == "external drain":
+            self._dispatch_hold = None
         if self._draining or not self._running:
             logger.info(
                 "External drain marker cleared during shutdown — not reverting "

@@ -143,6 +143,11 @@ def request_restart(runner, *, detached: bool, via_service: bool) -> bool:
     runner._restart_detached = detached
     runner._restart_via_service = via_service
     runner._restart_task_started = True
+    # Hold dispatch from the moment the restart is requested: the idle wait counts in-flight
+    # workers, and a dispatcher that keeps filling freed slots can keep that count above zero
+    # forever (observed: a 40-minute wait that never converged). The hold clears when this
+    # process exits; an aborted/forced restart is still followed by the same exit.
+    runner._dispatch_hold = {"reason": "restart requested", "since": time.time()}
     if getattr(runner, "_restart_force_event", None) is None:
         runner._restart_force_event = asyncio.Event()
 
