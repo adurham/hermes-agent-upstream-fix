@@ -9,6 +9,38 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only config — 2026-11-23 (desktop auto-continue): a restart-interrupted turn expired after 15 minutes, so the owner kept retyping "pick this back up"
+
+**Symptom.** Every restart of the desktop backend killed the running chats and nothing picked them up: the owner reopened
+the vent-controller chat hours later and had to type "pick this back up". Owner: "when the gateway restarts it is killing
+running sessions. I want them paused and gracefully resumed so I don't have to keep telling things to pick this back up."
+
+**Root cause.** Two halves, one of them correct. (1) The interrupt is deliberate: `tui_gateway/session_reaper.py::_
+stop_turns_before_exit` interrupts every in-flight turn on shutdown and gives it a short settle budget — a process cannot
+keep serving turns while it exits. (2) The recovery existed but had a 15-minute shelf life. `tui_gateway/turn_marker.py`
+writes a durable marker (original prompt + writer pid/start time) at turn start and clears it on any conclusion the client
+saw; only a process death leaves one behind, and `_maybe_schedule_auto_continue` re-submits it on session resume with a
+"some of the work may already be complete — check state, then finish" note. But `desktop.auto_continue.freshness_minutes`
+was 15, so a marker older than that was treated as stale and **cleared** — the turn was then unrecoverable even though the
+prompt was sitting right there. The messaging gateway has always used a 1 h window (`agent.gateway_auto_continue_freshness`);
+only the desktop path was that short.
+
+**Fix.** `desktop.auto_continue.freshness_minutes` 15 → **1440** (the marker store's own `_MAX_AGE_SECS` ceiling) and
+`max_attempts` 2 → **3**, in the default profile and all five PM lane profiles. `_auto_continue_config()` re-reads
+config.yaml per resume, so this is live without a restart.
+
+**Evidence.** The same machinery resumed a real turn before the change: `agent.log` 12:53:15 —
+`auto-continue scheduled for session 20261123_122841_fedea6 (attempt 1, interrupted 11s ago, writer pid 455873: dead,
+reader pid 2347183)` followed by `tui prompt accepted … kind=auto_continue chars=681`. Markers left by the 14:06 desktop
+restart were present in `~/.hermes/desktop/interrupted_turns.json` with `attempts: 0` and a dead writer — they were
+resumable, just past the window by the time the chat was reopened.
+
+**Limit.** This resumes the TASK, not the exact tool call: the continuation re-runs the original prompt from the session's
+current state. A true mid-turn checkpoint (resume inside the model/tool loop) is a much larger change and is not attempted
+here.
+
+**Deploy.** Config only, no code and no desktop rebuild.
+
 ### Fork-only fix — 2026-11-23 (gateway/kanban): a restart that waits for idle never converged — the dispatcher kept refilling every freed slot
 
 **Symptom.** `hermes gateway restart` (SIGUSR1) sat for 40+ minutes and never restarted. Every 300 s the log
