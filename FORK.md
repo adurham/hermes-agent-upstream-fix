@@ -9,6 +9,42 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only fix — 2026-11-23 (desktop About): the backend panel named the CLIENT install's commit, then said the backend was current
+
+**Symptom.** The updates overlay in backend mode printed `Commit a4f3ae4fb8e7…` directly under "The
+backend is running the latest version", while the backend it was talking to had restarted onto
+`61c33461ce`. Owner: "IT DOES DESCRIBE THE FUCKING BACKEND" — the panel presents itself as a backend
+report, so the commit row read as the backend's tree.
+
+**Root cause.** Two identities shared one row. `apps/desktop/electron/app-version.ts::appVersionInfo`
+fills `commit` from `INSTALL_STAMP.commit` — the stamp of the install this app runs from — and
+`VersionDetails` renders `version.commit` in every mode. On a remote connection (a Mac client against
+the workstation's backend) that stamp is the *client's* checkout, so a backend-scoped panel named the
+client's sha; the `Install ID` row printing `/Users/adam.durham/…` was the tell. The backend's real
+commit was already on the wire and thrown away: `resolveGatewayVersion` read only `displayVersion`
+from `/api/health`, which also carries `commit`.
+
+**Fix.** `resolveGatewayBuild()` returns `{version, commit}` from `/api/health`; the `hermes:version`
+IPC adds it as `backendCommit`; `VersionDetails` takes a `target` and, in backend mode, names the
+commit the connected process LOADED. The uncommitted `(!)` marker stays tied to the install stamp,
+and the About page (a client-install view) is unchanged.
+
+**Files.** `apps/desktop/electron/gateway-version.ts`, `apps/desktop/electron/main.ts`,
+`apps/desktop/src/global.d.ts`, `apps/desktop/src/components/version-details.tsx`,
+`apps/desktop/src/app/updates-overlay.tsx`; tests `apps/desktop/electron/gateway-version.test.ts`
+(the commit is carried, blank when the backend omits it) and
+`apps/desktop/src/components/version-details.test.tsx` (backend view names the backend's commit,
+client view keeps the stamp).
+
+**Evidence.** Live: `curl -s http://127.0.0.1:9119/api/health` →
+`"commit":"61c33461ce55df470aa76ae1d81898f45ea7dea0"` from the process started 12:53:08, while the
+client's stamp said `a4f3ae…`. Desktop tests: 25 (version-details + gateway-version), 6
+(about-settings), 7 (the three updates-overlay suites) passed; `tsc -p tsconfig.json` and
+`tsc -p tsconfig.electron.json` clean; eslint clean.
+
+**Deploy.** Desktop build only — the app has to be rebuilt and redeployed before its panel shows the
+backend's sha; nothing backend-side depends on it.
+
 ### Fork-only fix — 2026-11-23 (titles): a cloud `custom` route was treated as a single-slot local server, so a session's name waited for its turn to end
 
 **Symptom.** Desktop chats sat in the sidebar under the raw first words — `SO BOTH SESSIONS SHOULD`,

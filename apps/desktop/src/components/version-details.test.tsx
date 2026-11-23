@@ -117,6 +117,35 @@ describe('VersionDetails', () => {
     }
   })
 
+  it('names the backend\'s own commit in the backend view, not this install\'s stamp', () => {
+    const backend = '61c33461ce55df470aa76ae1d81898f45ea7dea0'
+    const stamp = 'a4f3ae4fb8e72446c0d0dcf2f2ad9b5e2b0f2c11'
+
+    const render_ = (target?: 'backend' | 'client') =>
+      render(
+        <I18nProvider configClient={null} initialLocale="en">
+          <VersionDetails
+            target={target}
+            version={{ ...baseVersion, backendCommit: backend, commit: stamp }}
+          />
+        </I18nProvider>
+      )
+
+    // Remote connection: the panel speaks about the backend process, so the row must name it.
+    render_(undefined)
+    expect(screen.queryByText(backend.slice(0, 14))).toBeNull()
+    expect(screen.getByText(stamp.slice(0, 14))).toBeTruthy()
+    cleanup()
+
+    render_('backend')
+    expect(screen.getByText(backend.slice(0, 14))).toBeTruthy()
+    expect(screen.queryByText(stamp.slice(0, 14))).toBeNull()
+    cleanup()
+
+    render_('client')
+    expect(screen.getByText(stamp.slice(0, 14))).toBeTruthy()
+  })
+
   it('opens the commit URL via the system-browser bridge without opening a preview tab', async () => {
     const openExternal: Mock<Window['hermesDesktop']['openExternal']> = vi
       .fn<Window['hermesDesktop']['openExternal']>()

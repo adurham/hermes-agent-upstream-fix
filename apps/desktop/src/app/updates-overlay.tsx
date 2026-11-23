@@ -361,7 +361,11 @@ function IdleView({
 
   // Only where Settings shows a selector: a custom branch or an older runtime gets the label alone.
   const details = version ? (
-    <VersionDetails channelAction={sourceUpdateChannel(status) ? changeChannel : undefined} version={version} />
+    <VersionDetails
+      channelAction={sourceUpdateChannel(status) ? changeChannel : undefined}
+      target={target}
+      version={version}
+    />
   ) : null
 
   // App-installer check-unknown (OS checker unavailable): NOT "no updates"

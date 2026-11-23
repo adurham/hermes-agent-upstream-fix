@@ -898,6 +898,9 @@ export interface DesktopVersionInfo {
   appVersion: string
   /** The active connection's backend runtime version ('' when unreachable). */
   backendVersion?: string
+  /** The commit the connected backend process LOADED (from its own /api/health). On a remote
+   *  connection this is a different tree from `commit` (this install's stamp). */
+  backendCommit?: string
   /** This machine's install: the stamp for packages, `hermes --version` for source installs. */
   clientVersion?: string
   /** Fixed release identity. Commit builds have no update channel. */

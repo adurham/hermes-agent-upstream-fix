@@ -288,7 +288,7 @@ import {
 } from './gateway-file-download'
 import { downloadViaOauthSessionToFile, downloadViaTokenToFile } from './gateway-file-download-transport'
 import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
-import { resolveGatewayVersion } from './gateway-version'
+import { resolveGatewayBuild, resolveGatewayVersion } from './gateway-version'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { windowsGitCandidates } from './git-binary-candidates'
 import { registerGitIpc } from './git-ipc'
@@ -16784,6 +16784,12 @@ function resolveHermesVersion(scope: { connectionId?: string; profile?: string }
   return resolveGatewayVersion(path => handleHermesApiRequest({ ...scope, path, timeoutMs: 5000 }))
 }
 
+/** The connected backend's version AND the commit it loaded (its own /api/health) — the About
+ *  panel's backend view names the process that is answering, not this client's install stamp. */
+function resolveHermesBuild(scope: { connectionId?: string; profile?: string } = {}) {
+  return resolveGatewayBuild(path => handleHermesApiRequest({ ...scope, path, timeoutMs: 5000 }))
+}
+
 // Renderer-bundle skew: `hermes update` moves the SOURCE TREE, but the UI
 // (including bundled plugins like Bot Mode) is compiled into this binary at
 // build time. A terminal-side update — or an in-app update whose bundle-swap
@@ -16824,16 +16830,21 @@ function showAboutPanelFresh(): void {
 }
 
 ipcMain.handle('hermes:version', async (_event, scope?: { connectionId?: string; profile?: string }) => {
-  const [skew, version, clientVersion] = await Promise.all([
+  const [skew, build, clientVersion] = await Promise.all([
     detectRendererSkew(),
-    resolveHermesVersion(scope),
+    resolveHermesBuild(scope),
     resolveDesktopClientVersion(INSTALL_STAMP, resolveUpdateRoot(), HERMES_HOME, app.getVersion())
   ])
+
+  const version = build.version
 
   return {
     ...appVersionInfo(INSTALL_STAMP, version, app.getVersion()),
     // Both sides, labelled: the backend the active connection runs, and this machine's install.
     backendVersion: version,
+    // The commit that backend process LOADED. `commit` below is this install's stamp, which on a
+    // remote connection is a different machine's tree — the backend view must name this one.
+    backendCommit: build.commit,
     clientVersion,
     electronVersion: process.versions.electron,
     nodeVersion: process.versions.node,

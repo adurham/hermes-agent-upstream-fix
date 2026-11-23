@@ -6,7 +6,7 @@ import { useI18n } from '@/i18n'
 import { distributionLabelKey } from '@/lib/distribution-label'
 import { ExternalLink } from '@/lib/external-link'
 import { shortVersion } from '@/lib/version-label'
-import { $updateStatus, sourceUpdateTrack } from '@/store/updates'
+import { $updateStatus, sourceUpdateTrack, type UpdateTarget } from '@/store/updates'
 
 /**
  * Human label for an external build's runtime source: the resolution rung
@@ -62,9 +62,25 @@ function SideVersionRow({ label, value }: { label: string; value?: string }) {
  * same version, branch, commit, distribution, runtime, and install id
  * from one source of truth.
  */
-export function VersionDetails({ version, channelAction }: { version: DesktopVersionInfo; channelAction?: ReactNode }) {
+export function VersionDetails({
+  version,
+  channelAction,
+  target
+}: {
+  version: DesktopVersionInfo
+  channelAction?: ReactNode
+  /** Which side this panel is speaking about. `backend` names the commit the connected process
+   *  LOADED; anything else names this install's stamp. */
+  target?: UpdateTarget
+}) {
   const { t } = useI18n()
   const u = t.updates
+
+  // The backend view names the process that answered: its own loaded commit. On a remote
+  // connection `version.commit` is THIS install's stamp, so the old row named the wrong tree.
+  const backendCommit = target === 'backend' ? version.backendCommit || '' : ''
+  const commit = backendCommit || version.commit
+  const commitIsThisInstall = !backendCommit
 
   const source =
     version.source === 'ci' ? 'CI' : version.source ? version.source[0].toUpperCase() + version.source.slice(1) : null
@@ -103,18 +119,18 @@ export function VersionDetails({ version, channelAction }: { version: DesktopVer
       </div>
       <SideVersionRow label={u.versionDetailsClient} value={version.clientVersion} />
       <SideVersionRow label={u.versionDetailsBackend} value={version.backendVersion} />
-      {version.commit && (
+      {commit && (
         <div className="flex justify-between gap-4">
           <dt className="text-muted-foreground">{u.versionDetailsCommit}</dt>
           <dd className="break-all text-right">
             <ExternalLink
               className="break-all font-mono text-xs"
-              href={`https://github.com/adurham/hermes-agent/commit/${version.commit}`}
+              href={`https://github.com/adurham/hermes-agent/commit/${commit}`}
               native
             >
-              {version.commit.slice(0, 14)}
+              {commit.slice(0, 14)}
             </ExternalLink>
-            {version.dirty && <span className="text-warning"> {u.versionDetailsUncommittedChanges}</span>}
+            {commitIsThisInstall && version.dirty && <span className="text-warning"> {u.versionDetailsUncommittedChanges}</span>}
           </dd>
         </div>
       )}
