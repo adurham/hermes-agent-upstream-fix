@@ -260,16 +260,11 @@ def _load_interim_assistant_messages() -> bool:
 
 def _shutdown_sessions() -> None:
     # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner):
+    # No turn drain here: this runs at atexit, when the loop and executors are gone — turns cannot finish, so a
+    # wait only delays the exit (see FORK.md, graceful-exit drain).
+    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
         with contextlib.suppress(Exception):
             step()
-    # Graceful pause: give in-flight turns the drain budget to finish before the exit interrupt, so a
-    # restart carries the work instead of killing it (tui_gateway.session_reaper._await_running_turns).
-    with contextlib.suppress(Exception):
-        from tui_gateway.session_reaper import _await_running_turns
-        _await_running_turns()
-    with contextlib.suppress(Exception):
-        _stop_turns_before_exit()
     with _sessions_lock:
         sids = list(_sessions)
     for sid in sids:

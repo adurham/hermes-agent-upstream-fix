@@ -221,10 +221,10 @@ def _handle_exit_flush_signal(signum, frame) -> None:
         return
     with contextlib.suppress(Exception):
         _flush_sessions_before_exit()
-    # Graceful pause: let in-flight turns finish before the exit interrupt, so a restart carries the
-    # work instead of killing it. Bounded by desktop.exit_drain_seconds; past it the old path runs.
-    with contextlib.suppress(Exception):
-        _await_running_turns()
+    # NOTE: do NOT wait for running turns here. This handler runs on the event-loop thread, so any
+    # blocking wait freezes the loop the turns need to stream and settle — the drain would starve the
+    # very work it is waiting for. The graceful path must drain BEFORE the stop (updater asks the
+    # backend to drain while serving, then stops) or as a loop task; see FORK.md.
     # The group signal that stopped us never reaches a command in its own session: reap it now,
     # before a supervisor's SIGKILL can cut the graceful shutdown (and its atexit) short.
     with contextlib.suppress(Exception):

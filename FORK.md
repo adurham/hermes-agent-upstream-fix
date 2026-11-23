@@ -21,29 +21,37 @@ turn. Two supervisors made any wait impossible anyway: `hermes-desktop-serve.ser
 `hermes_cli/dashboard_procs.py::_POSIX_TERM_GRACE_SECONDS` (the updater's stop) waited 10 s before SIGKILL. So a restart
 was always "kill now"; the only recovery was the resume marker, which the owner had to trigger by reopening the chat.
 
-**Fix.** The shutdown drains before it interrupts. `_await_running_turns(budget)` polls the live session map and returns
-once nothing is `running`, or when the budget is spent — then `_stop_turns_before_exit` runs exactly as before. Budget is
-`desktop.exit_drain_seconds` (default **900**, env `HERMES_TUI_EXIT_DRAIN_S`, `0` disables). It is wired into both exit
-paths: `_handle_exit_flush_signal` (uvicorn's SIGTERM, the dashboard/desktop backend) and `server._shutdown_sessions`
-(atexit / the TUI entry). Both supervisors now outlast it: `dashboard_procs._stop_grace_seconds()` computes the
-SIGTERM→SIGKILL grace from the same budget (+30 s), and the unit's `TimeoutStopSec` is raised to 1000 s by a drop-in.
+**Fix (partial — primitive in, wiring pending).** `_await_running_turns(budget)` and `_exit_drain_budget()` are in place
+and tested: a poll with a hard deadline over the live session map, budget `desktop.exit_drain_seconds` (default **900**,
+env `HERMES_TUI_EXIT_DRAIN_S`, `0` disables), plus `dashboard_procs._stop_grace_seconds()` so the updater's SIGTERM→SIGKILL
+grace outlasts any drain. The unit's `TimeoutStopSec` is raised to 1000 s by a drop-in.
 
-**Files.** `tui_gateway/session_reaper.py` (`_exit_drain_budget`, `_await_running_turns`, the drain call in
-`_handle_exit_flush_signal`), `tui_gateway/server.py` (`_shutdown_sessions`), `hermes_cli/dashboard_procs.py`
+**Why it is not wired into the signal path.** The first cut called the drain from `_handle_exit_flush_signal`, and Fable's
+review killed it: that handler runs on the event-loop thread, so a 900 s wait freezes the loop the turns need to stream and
+settle — the drain starves the very turns it waits for. The same applies at atexit, where the loop and executors are
+already gone. So the exit paths keep the interrupt, with a comment pointing here. The correct wiring is the *pre-stop*
+drain: the updater asks the backend to drain while it is still serving (loop alive, client attached, cancellable), then
+stops; the SIGTERM budget then drops back to seconds. Not built yet.
+
+**Files.** `tui_gateway/session_reaper.py` (`_exit_drain_budget`, `_await_running_turns`), `hermes_cli/dashboard_procs.py`
 (`_stop_grace_seconds`); tests `tests/tui_gateway/test_exit_drain.py` (6: idle returns at once, a finishing turn is waited
 for, the budget is honoured, 0 disables, env/config resolution, the stop grace outlasts the drain).
+
+**Also required, not built:** a `draining` flag that refuses new prompts; per-turn stall cutoff (a turn waiting on user
+input with no client never finishes); client-side auto-resume of restart-cut markers on reconnect; `KillMode=mixed` so
+tool subprocesses are not SIGTERMed at t=0.
 
 **Evidence.** `tests/tui_gateway/test_exit_drain.py` 6 passed; the exit/flush/shutdown selection across
 `tests/tui_gateway` 757 passed, 1 error — a conftest import-order artifact
 (`notification_park ... partially initialized module`) that passes when that file runs alone and is unrelated to this
 change.
 
-**Deploy.** Code takes effect on the next backend restart — the first restart after this commit is still the old
-behaviour. **Host requirement:** `~/.config/systemd/user/hermes-desktop-serve.service.d/50-graceful-exit.conf` with
-`TimeoutStopSec=1000` must exist (the repo cannot ship a unit drop-in), then `systemctl --user daemon-reload`.
+**Deploy.** Nothing changes live yet (the drain is not on any exit path). **Host requirement for the eventual wiring:**
+`~/.config/systemd/user/hermes-desktop-serve.service.d/50-graceful-exit.conf` with `TimeoutStopSec=1000` (installed here),
+then `systemctl --user daemon-reload`.
 
-**Limit.** A turn longer than the budget is still interrupted at the deadline (that is the point of the deadline); the
-marker/auto-continue path then resumes it. This is a *drain*, not a mid-turn checkpoint.
+**Limit.** A drain is not a checkpoint: a turn longer than the budget is still interrupted, and the marker/auto-continue
+path then resumes the task (not the exact tool call).
 
 ### Fork-only config — 2026-11-23 (desktop auto-continue): a restart-interrupted turn expired after 15 minutes, so the owner kept retyping "pick this back up"
 
