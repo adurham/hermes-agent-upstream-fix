@@ -5,6 +5,7 @@ is called, cannot fail), then an **upgrade** from one small-model call (cheap ti
 JSON-constrained). Storage enforces provenance ``derived < llm < user``: stage 2 only replaces stage 1
 and neither replaces a name the user typed."""
 
+import ipaddress
 import itertools
 import json
 import logging
@@ -16,6 +17,7 @@ import unicodedata
 import weakref
 from contextlib import suppress
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
@@ -269,10 +271,21 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     persisted as a genuine assistant row and replayed, and the model adopts the format (#117296).
     Running the title call after the turn settles keeps the two requests off the wire at once.
     Hosted providers multiplex requests independently and keep the turn-start timing.
+
+    FORK: "self-hosted" is a property of the ENDPOINT, not the provider id. A ``custom`` route pointed at
+    a public, multi-tenant gateway (``https://ollama.com/v1`` is a ``custom`` provider in this profile)
+    multiplexes exactly like a hosted one, so waiting to the turn's end bought nothing and cost the name:
+    the instant derived title stayed in the sidebar for the whole first turn, and a long or interrupted
+    first turn never upgraded at all. Only a loopback/LAN endpoint keeps the wait (``_endpoint_is_local``).
+    ``auxiliary.title_generation.defer_until_turn_end`` (bool) forces either answer for a single-slot
+    server that happens to sit behind a public address.
     """
     provider = str((main_runtime or {}).get("provider") or "").strip().lower()
     if not _is_self_hosted_provider(provider):
         return False
+    override = _title_defer_override()
+    if override is not None:
+        return override
     try:
         cfg = _title_config()
         pinned_provider = str(cfg.get("provider") or "").strip().lower()
@@ -283,7 +296,67 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     except Exception:
         return True
     pinned_base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-    return not pinned_base_url or pinned_base_url == main_base_url
+    if pinned_base_url and pinned_base_url != main_base_url:
+        return False
+    if (pinned_base_url or main_base_url) and not _endpoint_is_local(pinned_base_url or main_base_url):
+        return False
+    return True
+
+
+def _title_defer_override() -> Optional[bool]:
+    """``auxiliary.title_generation.defer_until_turn_end``: True/False force the wait, None decides by endpoint."""
+    try:
+        raw = _title_config().get("defer_until_turn_end")
+    except Exception:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if text in ("true", "yes", "on", "1"):
+        return True
+    if text in ("false", "no", "off", "0"):
+        return False
+    return None
+
+
+# Hostname suffixes that resolve inside the LAN/this host rather than the public DNS root.
+_LOCAL_HOST_SUFFIXES = (
+    ".local", ".localdomain", ".internal", ".lan", ".home.arpa", ".localhost", ".ts.net",
+)
+
+
+def _endpoint_is_local(base_url: str) -> bool:
+    """True when ``base_url`` names this machine or its LAN — one server, one request slot.
+
+    A public host (vendor API, hosted gateway) multiplexes requests, so it is never the single-slot
+    server #117296 protects. Empty or unparseable keeps the conservative answer (True: wait).
+    ``.ts.net`` (Tailscale MagicDNS) is treated as LAN: it resolves to a private 100.64/10 address.
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return True
+    try:
+        parsed = urlsplit(raw if "://" in raw else "//" + raw)
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+    except ValueError:
+        return True
+    if not host:
+        return True
+    if host in ("localhost", "localhost.localdomain", "::1"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        return not address.is_global
+    if host.endswith(_LOCAL_HOST_SUFFIXES):
+        return True
+    # A single-label name (`vllm`, `gpu-box`) resolves on the LAN, not the public DNS root.
+    return "." not in host
+
 
 
 def _is_self_hosted_provider(provider: str) -> bool:

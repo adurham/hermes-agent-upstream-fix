@@ -690,6 +690,55 @@ class TestMaybeAutoTitle:
                 patch("hermes_cli.config.load_config_readonly", return_value=keyed):
             assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
 
+    @pytest.mark.parametrize(
+        "base_url, deferred",
+        [
+            # FORK: a `custom` route is only single-slot when the ENDPOINT is local. A public,
+            # multi-tenant gateway multiplexes like any hosted provider, so the name is generated
+            # at turn start instead of at the end of the turn (long/interrupted first turns never
+            # got a name that way — 2026-11-23).
+            ("https://ollama.com/v1", False),
+            ("https://api.example.com/v1", False),
+            ("http://127.0.0.1:8080/v1", True),
+            ("http://localhost:11434/v1", True),
+            ("http://[::1]:8080/v1", True),
+            ("http://192.168.86.11:8000/v1", True),
+            ("http://10.0.0.2:8080/v1", True),
+            ("http://172.16.5.4:8000/v1", True),
+            ("http://100.66.38.13:8000/v1", True),  # Tailscale CGNAT
+            ("http://gpu-box.ts.net:8000/v1", True),  # Tailscale MagicDNS
+            ("http://vllm:8000/v1", True),  # single-label LAN name
+            ("http://pve01.local:8000/v1", True),
+            ("", True),  # unknown endpoint: keep the conservative wait
+        ],
+    )
+    def test_a_public_custom_endpoint_keeps_the_turn_start_timing(self, base_url, deferred):
+        """FORK: #117296 guards a single-slot server, and a public host is not one."""
+        from agent import title_generator as tg
+
+        with patch.object(tg, "_title_config", return_value={}):
+            assert tg.title_upgrade_must_wait_for_turn({"provider": "custom", "base_url": base_url}) is deferred
+
+    @pytest.mark.parametrize(
+        "main_runtime, title_cfg, deferred",
+        [
+            # The explicit override wins over the endpoint heuristic, for a single-slot server that
+            # sits behind a public address (or a LAN one the owner does not mind sharing).
+            ({"provider": "custom", "base_url": "https://ollama.com/v1"}, {"defer_until_turn_end": True}, True),
+            ({"provider": "custom", "base_url": "http://10.0.0.2:8080/v1"}, {"defer_until_turn_end": False}, False),
+            ({"provider": "custom", "base_url": "https://ollama.com/v1"}, {"defer_until_turn_end": "no"}, False),
+            # A hosted main route never waits, whatever the override says.
+            ({"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"},
+             {"defer_until_turn_end": True}, False),
+        ],
+    )
+    def test_defer_until_turn_end_override(self, main_runtime, title_cfg, deferred):
+        """FORK: `auxiliary.title_generation.defer_until_turn_end` forces the answer either way."""
+        from agent import title_generator as tg
+
+        with patch.object(tg, "_title_config", return_value=title_cfg):
+            assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
+
     def test_kanban_worker_is_named_after_its_card_without_the_llm_thread(self, tmp_path, monkeypatch):
         """A worker's session takes the board card's title synchronously; no auxiliary model call (#111166)."""
         from hermes_cli import kanban_db, kanban_db_connect

@@ -9,6 +9,51 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only fix — 2026-11-23 (titles): a cloud `custom` route was treated as a single-slot local server, so a session's name waited for its turn to end
+
+**Symptom.** Desktop chats sat in the sidebar under the raw first words — `SO BOTH SESSIONS SHOULD`,
+`ok I think we need more cleanup on the…` — for the whole first turn, and several never upgraded at
+all. Owner: "I'm noticing that the sessions aren't getting named". A chat opened by pasting a file
+had no name at all, so the sidebar fell back to the paste path (`@FILE: .HERMES/ATTACHMEN…`).
+
+**Root cause.** Auto-titling is two stages: an instant `derived` slice, then a model title.
+`agent/title_generator.py::title_upgrade_must_wait_for_turn` (#117296) holds the model call until the
+turn ends whenever the main route counts as "self-hosted" — any `custom` provider — and the
+`auxiliary.title_generation` pin resolves to the same `base_url`. This profile runs
+`deepseek-v4.1-flash:1017` on `ollama-cloud-team` (`https://ollama.com/v1`), which reaches the runtime
+as provider `custom`, with the title model pinned to that same route. Both conditions matched, so
+every session deferred its name to the end of turn 1. These first turns run 75–83 API calls (10–20
+minutes), so the slice stayed up that long; a turn interrupted before `finalize_turn` never upgraded
+at all. The wait also bought nothing: `ollama.com` is a multiplexed cloud API, not the one-slot local
+server the guard was written for.
+
+**Fix.** "Self-hosted" is now a property of the ENDPOINT, not the provider id.
+`_endpoint_is_local(base_url)` treats loopback, private/CGNAT/link-local addresses
+(`ipaddress.is_global` false), `.local`/`.localdomain`/`.internal`/`.lan`/`.home.arpa`/`.ts.net`
+suffixes and single-label hostnames as local; a public host never waits, whatever the provider is
+called. Empty or unparseable keeps the old conservative answer (wait).
+`auxiliary.title_generation.defer_until_turn_end` (bool) forces either answer, for a single-slot
+server behind a public address or a LAN box the owner does not mind sharing. A hosted main route and
+a pin naming a different endpoint short-circuit as before.
+
+**Files.** `agent/title_generator.py` (`title_upgrade_must_wait_for_turn`, `_title_defer_override`,
+`_endpoint_is_local`); tests `tests/agent/test_title_generator.py::TestMaybeAutoTitle::test_a_public_custom_endpoint_keeps_the_turn_start_timing`
+and `::test_defer_until_turn_end_override`.
+
+**Evidence.** With the pre-fix pin (main `https://ollama.com/v1`, title pinned to `ollama-cloud-team`)
+`title_upgrade_must_wait_for_turn` returned True; it returns False now, while a loopback or LAN main
+route with an unpinned title still returns True. A live probe through `maybe_auto_title` on a
+throwaway session row wrote its title inline (source `llm`), and the row was removed.
+`tests/agent/test_title_generator.py` 140 passed, 1 deselected
+(`test_marker_prefix_matches_gateway_constant` fails on the clean tree too: the 3.11 venv imports a
+3.14 `pydantic_core`); `tests/agent/test_turn_finalizer_iteration_limit_exit.py` +
+`tests/agent/test_turn_context.py` 72 passed; ruff clean. `tests/e2e/core/tenancy` is unaffected —
+its fleet serves every role on `127.0.0.1`.
+
+**Deploy.** Code only takes effect after a restart (`hermes update` or the app's Update). Until then
+this profile's title pin is `nous` / `deepseek/deepseek-v4.1-flash-1017`, whose different endpoint
+already avoids the wait, and the five stuck desktop sessions were backfilled by hand.
+
 ### Upstream sync — 2026-11-19 (v0.23.1 → v0.23.3, 9,829 commits, 8,484 files, 115 conflict files)
 
 **Range.** `v0.23.1` (`3b421578588`, merged 2026-11-12) → `v0.23.3` (`caafe5389ae`): 9,829 commits, 8,484
