@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import os
 import queue
 import secrets
 import threading
@@ -121,6 +122,62 @@ def _flush_sessions_before_exit(budget_s: float | None = None) -> int:
 # Bounded wait for interrupted turns on the way out; the SIGTERM path hard-exits after a ~1s grace.
 _EXIT_TURN_SETTLE_S = 0.5
 
+# Graceful-exit drain: a supervisor stop (systemd SIGTERM, update restart) first waits for in-flight
+# turns to finish, so a restart pauses work instead of killing it. Bounded — past the budget the old
+# interrupt path runs. The unit's TimeoutStopSec must outlast the budget (see FORK.md).
+_EXIT_DRAIN_DEFAULT_S = 900.0
+
+
+def _exit_drain_budget() -> float:
+    """Seconds a shutdown may wait for running turns: ``desktop.exit_drain_seconds`` /
+    ``HERMES_TUI_EXIT_DRAIN_S``, 0 disables the drain."""
+    raw = os.environ.get("HERMES_TUI_EXIT_DRAIN_S")
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    try:
+        from hermes_cli.config import load_config
+        desktop = load_config().get("desktop") or {}
+        value = desktop.get("exit_drain_seconds") if isinstance(desktop, dict) else None
+        if value is not None:
+            return max(0.0, float(value))
+    except Exception:
+        pass
+    return _EXIT_DRAIN_DEFAULT_S
+
+
+def _await_running_turns(budget_s: float | None = None) -> bool:
+    """Wait up to ``budget_s`` for in-flight turns to finish. True when nothing is running.
+
+    A stop that arrives mid-turn is not an outage: the process keeps serving until the turn settles,
+    then exits. Polled rather than event-driven on purpose — a shutdown path must not depend on a
+    turn's own bookkeeping (a wedged turn never signals), and the deadline is the escape hatch.
+    """
+    budget = _exit_drain_budget() if budget_s is None else max(0.0, budget_s)
+    deadline = time.monotonic() + budget
+    announced = False
+    while True:
+        with _sessions_lock:
+            running = [(sid, s) for sid, s in _sessions.items() if s.get("running")]
+        if not running:
+            if announced:
+                logger.info("graceful exit: in-flight turns finished; continuing shutdown")
+            return True
+        if budget <= 0 or time.monotonic() >= deadline:
+            logger.warning(
+                "graceful exit: %d turn(s) still running after %.0fs of drain; interrupting them "
+                "(desktop.exit_drain_seconds)", len(running), budget)
+            return False
+        if not announced:
+            announced = True
+            logger.info(
+                "graceful exit: waiting up to %.0fs for %d in-flight turn(s) to finish: %s",
+                budget, len(running), ", ".join(sorted(sid for sid, _ in running))[:400])
+        time.sleep(0.5)
+
+
 
 def _stop_turns_before_exit(budget_s: float | None = None) -> None:
     """Interrupt every in-flight turn and give it ``budget_s`` to settle, so a running tool call ends
@@ -164,6 +221,10 @@ def _handle_exit_flush_signal(signum, frame) -> None:
         return
     with contextlib.suppress(Exception):
         _flush_sessions_before_exit()
+    # Graceful pause: let in-flight turns finish before the exit interrupt, so a restart carries the
+    # work instead of killing it. Bounded by desktop.exit_drain_seconds; past it the old path runs.
+    with contextlib.suppress(Exception):
+        _await_running_turns()
     # The group signal that stopped us never reaches a command in its own session: reap it now,
     # before a supervisor's SIGKILL can cut the graceful shutdown (and its atexit) short.
     with contextlib.suppress(Exception):

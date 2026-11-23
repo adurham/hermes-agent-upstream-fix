@@ -562,6 +562,17 @@ def _wait_gone(pids: list[int], seconds: float) -> list[int]:
     return alive
 
 
+def _stop_grace_seconds() -> float:
+    """SIGTERM→SIGKILL grace for a backend stop: must outlast the backend's own in-flight-turn drain
+    (``tui_gateway.session_reaper._exit_drain_budget``) or a graceful restart is cut short by our
+    SIGKILL and the very turns the drain was carrying are lost."""
+    try:
+        from tui_gateway.session_reaper import _exit_drain_budget
+        return max(_POSIX_TERM_GRACE_SECONDS, _exit_drain_budget() + 30.0)
+    except Exception:
+        return _POSIX_TERM_GRACE_SECONDS
+
+
 def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int, str]]) -> None:
     """SIGTERM, wait up to ``_POSIX_TERM_GRACE_SECONDS`` for graceful exit, SIGKILL survivors, then
     sweep the dashboard-owned descendants that outlived the root and wait for the tree to be gone.
@@ -589,7 +600,7 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
     for pid in pids:
         _send(pid, _signal.SIGTERM)
     pending = [p for p in pids if p not in killed and p not in {f[0] for f in failed}]
-    alive = _wait_gone(pending, _POSIX_TERM_GRACE_SECONDS)
+    alive = _wait_gone(pending, _stop_grace_seconds())
     killed.extend(p for p in pending if p not in alive)
     for pid in alive:
         _send(pid, _signal.SIGKILL)
