@@ -125,7 +125,7 @@ def export_board(
     if not kb.board_exists(slug):
         raise ValueError(f"board {slug!r} does not exist")
 
-    db_path = kb.kanban_db_path(slug)
+    db_path = kb.board_db_path(slug)
     if not db_path.exists():
         raise FileNotFoundError(f"board {slug!r} has no database at {db_path}")
 

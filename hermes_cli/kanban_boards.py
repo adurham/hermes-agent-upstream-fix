@@ -23,11 +23,18 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+    """``{status: count}`` for a board. Safe to call on an empty DB.
+
+    Resolves the board's OWN ``kanban.db`` (:func:`kanban_db.board_db_path`), never
+    the active/pinned connection: inside a dispatched worker or a pinned gateway
+    flow ``kanban_db_path(board=slug)`` answers with the pinned file for every
+    slug, which printed one board's counts on every row of ``boards list``.
+    """
     try:
-        if not kb.kanban_db_path(board=slug).exists():
+        db_path = kb.board_db_path(slug)
+        if not db_path.exists():
             return {}
-        with kbc.connect_closing(board=slug) as conn:
+        with kbc.connect_closing(db_path=db_path, board=slug) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
@@ -53,6 +60,10 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
+        # ``db_path`` from board metadata is the ROUTING path (pin-aware, so every
+        # slug can name one file). A row's path must name the file its counts came
+        # from, else "hub — <default>/kanban.db — 2/3/19" is two boards in one row.
+        b["db_path"] = str(kb.board_db_path(b["slug"]))
         b["counts"] = _board_task_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
     if _json_out(args, boards):
@@ -134,7 +145,10 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
-    print(f"  DB path:      {meta['db_path']}\n"
+    # The board's OWN file, matching the counts below it — metadata's ``db_path``
+    # is the pin-aware routing path and would name another board's DB whenever
+    # HERMES_KANBAN_DB pins a different one than ``current``.
+    print(f"  DB path:      {kb.board_db_path(current)}\n"
           f"  Tasks:        {sum(counts.values())} total" + (f" ({_fmt_counts(counts)})" if counts else ""))
     return 0
 

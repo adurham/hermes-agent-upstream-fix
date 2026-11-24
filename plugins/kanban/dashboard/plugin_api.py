@@ -1365,11 +1365,17 @@ def _projects_by_id() -> dict[str, Any]:
 
 
 def _board_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board; ``{}`` on a missing/empty DB."""
+    """``{status: count}`` for a board; ``{}`` on a missing/empty DB.
+
+    Uses the board's OWN DB (:func:`kanban_db.board_db_path`), not the pin-aware
+    routing path: a pinned gateway/worker resolves every slug to one file, which
+    made the board switcher show identical counts for every board.
+    """
     try:
-        if not kanban_db.kanban_db_path(board=slug).exists():
+        db_path = kanban_db.board_db_path(slug)
+        if not db_path.exists():
             return {}
-        with closing(kbc.connect(board=slug)) as conn:
+        with closing(kbc.connect(db_path=db_path, board=slug)) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
             return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
@@ -1414,6 +1420,10 @@ def list_boards(include_archived: bool = Query(False)):
     proj_map = _projects_by_id()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
+        # Same row, same board: metadata's ``db_path`` is the pin-aware routing
+        # path, so a pinned process would label every board with one file while
+        # the counts below come from each board's own DB.
+        b["db_path"] = str(kanban_db.board_db_path(b["slug"]))
         b["counts"] = _board_counts(b["slug"])
         # Live cards only — archived tasks are hidden from every default board view,
         # so counting them in the switcher badge would visibly disagree.

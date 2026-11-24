@@ -677,6 +677,26 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return _board_path("HERMES_KANBAN_DB", board, ("kanban.db",), "kanban.db")
 
 
+def board_db_path(board: Optional[str] = None) -> Path:
+    """The board's OWN ``kanban.db`` on disk: no ``HERMES_KANBAN_DB`` env pin, no
+    scoped ``--board`` context, no worker/delegated fence.
+
+    :func:`kanban_db_path` is a *routing* resolver — inside a dispatched worker (or
+    any flow wrapped in :func:`pin_first_board_resolution`) it answers with the
+    pinned file for EVERY slug, which is exactly what the isolation fence needs.
+    A per-board *enumeration* asks a different question: which file holds THIS
+    board's rows. Resolving those through the routing resolver collapsed every row
+    of ``hermes kanban boards list`` onto the pinned DB, so one board's counts were
+    printed for all of them (hub showed the root DB's 12/6/325 while hub's own file
+    held 2/3/19, and ps5's 1314 archived tasks were invisible). Use this for
+    readouts that describe a board rather than route work into it.
+    """
+    slug = _normalize_board_slug(board) or get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home().joinpath("kanban.db")
+    return board_dir(slug) / "kanban.db"
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Per-board scratch workspace root (``HERMES_KANBAN_WORKSPACES_ROOT`` wins);
     ``default`` keeps the legacy ``<root>/kanban/workspaces/``."""
