@@ -9,6 +9,45 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only fix — 2026-11-23 (auxiliary timeouts): a connect/TLS stall consumed the whole generation budget
+
+**Symptom.** `ps5-pm` logged `Auxiliary consult: using ollama-cloud-team (kimi-k3.1-pro)` at 15:21:47 and did not
+reach `fallback candidate fallback_chain[0](nous)` until 15:41:51 — **20 minutes on one rung**, all six PM
+profiles affected. The failure was `httpx.ConnectTimeout: _ssl.c:1064: The handshake operation timed out`
+surfaced as `openai.APITimeoutError`; raising `auxiliary.<task>.timeout` made it worse.
+
+**Root cause.** `_build_call_kwargs` passed the budget as a bare scalar `timeout=<float>`. openai-python hands a
+scalar to httpx as `httpx.Timeout(total)`, so the **connect phase** (TCP + TLS handshake) was allowed the task's
+entire generation budget on every attempt — and the same-provider retry added two more full windows before the
+fallback chain was tried. A connect stall is diagnosable in seconds; a reasoning model generating for ten
+minutes is healthy. The scalar applied the one budget to both, which is the inverse of what is wanted.
+
+**Fix.** `_wire_timeout()` emits `httpx.Timeout(budget, connect=_AUX_CONNECT_TIMEOUT_SECONDS)` (10 s) and
+`_build_call_kwargs` is the single emitter for all five request builders (primary, same-provider retry,
+fallback candidate, async, vision). Internal guards do arithmetic on the budget, never on the wire object:
+`_timeout_seconds()` unwraps `.read` at the boundary of `_aux_stream_total_ceiling`,
+`_anthropic_no_progress_timeout`, the Codex stream guard (`_CodexStreamGuard` total ceiling) and
+`_LadderRoute.timeout`. `_is_connect_phase_failure()` (via `agent.timeout_error_summary._timeout_phase`) skips
+the same-provider transient retry for a connect-phase failure — retrying a dead edge only multiplies the wait —
+and the fallback warning now names the connect cap instead of telling the operator to raise a timeout knob that
+cannot help. Config semantics are unchanged: `auxiliary.<task>.timeout` remains the generation budget
+(read/write/pool), `no_progress_timeout` still clamps against it, and the connect cap is a constant, not a knob.
+
+**Files.** `agent/auxiliary_client.py`; tests `tests/agent/test_auxiliary_connect_timeout.py` (new, 19 — real
+sockets, no mocks of the stall) and `tests/agent/test_auxiliary_compression_timeout_floor.py` (asserts the read
+budget **and** the wire split, so the connect cap cannot regress into a total cap).
+
+**Evidence.** Against a real blackholed host (`192.0.2.1:443`, SYN dropped, no RST) with a 300 s generation
+budget: pre-fix scalar `timeout=20` failed at **20.13 s** (the whole budget went to connect); the split failed
+at **10.01 s** with `APITimeoutError <- ConnectTimeout`. Against a live socket that accepts TCP and never
+answers TLS (the ps5-pm shape): 20.62 s vs 10.01 s. End to end, `ac.call_llm` reached its fallback in **10.2 s**
+(was 33.7 s — connect cap plus two same-provider retries). A slow-but-alive reasoning call that answers after
+11.5 s still completes under a 60 s budget.
+
+**Deploy.** Source change: the gateway and `hermes-desktop-serve` import this checkout at process start, so it
+is live on the next start of each. A restart interrupts in-flight turns across six PM profiles — stage it for
+an owned window; nothing here hot-patches a live install.
+
 ### Fork-only fix — 2026-11-23 (desktop exit): a restart killed live turns instead of pausing them
 
 **Symptom.** Every backend restart or update cut whatever chat was mid-turn. Owner, twice: "when the gateway restarts it is

@@ -1585,7 +1585,7 @@ class _CodexCompletionsAdapter:
         wire_aliases = resp_kwargs.pop("_wire_aliases", None) or {}
         issuer_kind = resp_kwargs.pop("_issuer_kind", None)
         issuer_model = str(resp_kwargs.get("model") or model)
-        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+        total_timeout = _timeout_seconds(timeout) if _is_positive_timeout(timeout) else None
         guard = _CodexStreamGuard(self._client, total_timeout, no_progress_timeout=kwargs.get("no_progress_timeout"))
         deadline_hit = False
         try:
@@ -1809,7 +1809,9 @@ class _AnthropicCompletionsAdapter:
                 if not isinstance(existing, dict):
                     existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
-        if isinstance(kwargs.get("timeout"), (int, float)) and kwargs["timeout"] > 0:  # else the client's 900 s read
+        # Forward the caller's wire timeout (``httpx.Timeout``: short connect cap, full read budget);
+        # a non-budget falls back to the client's 900 s read.
+        if _is_positive_timeout(kwargs.get("timeout")):
             anthropic_kwargs["timeout"] = kwargs["timeout"]
         response = create_anthropic_message(
             self._client,
@@ -1864,11 +1866,9 @@ def _anthropic_no_progress_timeout(
     ``_aux_stream_total_ceiling`` instead.
     """
     window = _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
-    try:
-        if effective_timeout is not None and float(effective_timeout) > 0:
-            window = min(window, float(effective_timeout))
-    except (TypeError, ValueError):
-        pass
+    effective_timeout = _timeout_seconds(effective_timeout)  # a wire httpx.Timeout carries the budget in .read
+    if effective_timeout is not None and effective_timeout > 0:
+        window = min(window, effective_timeout)
     return window
 
 
@@ -3549,13 +3549,27 @@ def _without_reasoning_fields(kwargs: dict) -> Optional[dict]:
 _TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision", "title_generation"})
 
 
+def _is_connect_phase_failure(failure: aux_errors.Failure) -> bool:
+    """True when no TCP/TLS connection was ever established (``ConnectTimeout`` anywhere in the chain).
+
+    The endpoint itself is the problem, so the same provider retried immediately hits the same dead
+    edge: the retry only multiplies the wait before the fallback chain is tried.
+    """
+    from agent.timeout_error_summary import _timeout_phase
+    return _timeout_phase(failure.error) == "connect"
+
+
 def _should_skip_same_provider_retry(task: Optional[str], failure: aux_errors.Failure) -> bool:
     """True when a transient error on a critical-path task should go straight to fallback.
 
-    Carve-out: a fast first-token fail (dead stream within the no-progress window, zero output —
-    see ``_timeout_message``) is cheap and keeps the same-provider retry; mid-stream stalls and
-    hard-ceiling timeouts skip to fallback.
+    Carve-outs: a fast first-token fail (dead stream within the no-progress window, zero output — see
+    ``_timeout_message``) is cheap and keeps the same-provider retry; mid-stream stalls and hard-ceiling
+    timeouts skip to fallback. A CONNECT-phase timeout skips for a different reason: the retry would
+    re-hit an endpoint that never answered, at the full connect budget each time (ps5-pm burned 30 s of
+    connect caps + backoff before its first fallback, 2026-11-23).
     """
+    if _is_connect_phase_failure(failure):
+        return True
     return (task in _TIMEOUT_NO_RETRY_TASKS and failure.verdict.error_context.get("transport") == "timeout"
             and "no-progress timeout" not in str(failure.error))
 
@@ -7393,6 +7407,70 @@ def _merge_aux_extra_body(
     return merged_extra
 
 
+# ── The connect-phase budget ──────────────────────────────────────────────────────────────────────
+# A stalled TCP connect or TLS handshake is diagnosable in seconds; a reasoning model generating for
+# ten minutes is healthy and must not be cut. So the request timeout is split: the CONNECT phase gets
+# its own short cap while read/write/pool keep the task's whole generation budget.
+#
+# A bare scalar cannot express that split. openai-python hands ``timeout=300`` to httpx as
+# ``httpx.Timeout(300)``, which applies the FULL generation budget to the connect phase, so a dead edge
+# burns ``auxiliary.<task>.timeout`` (and, for a retryable task, its same-provider retry) before the
+# fallback chain is even tried. ps5-pm spent 20 minutes on a stalled handshake before moving on
+# (2026-11-23: ``httpx.ConnectTimeout: The handshake operation timed out``). See #t_da58288d.
+_AUX_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
+def _wire_timeout(timeout: Any) -> Any:
+    """The ``timeout`` for a request: a short CONNECT cap plus *timeout* for read/write/pool.
+
+    Non-budgets (``None``, 0, negative, unparseable) pass through unchanged, keeping the "no
+    per-request override, the client's own timeout governs" meaning. Idempotent: an ``httpx.Timeout``
+    is returned as-is, so a rebuilt or re-sent request keeps the split it already carries.
+    """
+    import httpx  # lazy: httpx/SSL costs ~0.3 s of CLI startup (see the availability-stub note above)
+    if isinstance(timeout, (httpx.Timeout, bool)):
+        return timeout  # already split / not a budget: never turn True into a 1 s timeout
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        return timeout
+    if seconds <= 0:
+        return timeout
+    # Never RAISE the connect budget above the caller's own: a deliberately tiny timeout stays tiny.
+    return httpx.Timeout(seconds, connect=min(_AUX_CONNECT_TIMEOUT_SECONDS, seconds))
+
+
+def _is_positive_timeout(timeout: Any) -> bool:
+    """True for a real positive budget: a number, or a wire ``httpx.Timeout`` with a positive read.
+
+    Deliberately not ``float(timeout) > 0``: a string like ``"30"`` is a caller bug, and forwarding it
+    to an SDK as a timeout is worse than leaving the client's own default in place.
+    """
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+        return float(timeout) > 0
+    read = getattr(timeout, "read", None)
+    return isinstance(read, (int, float)) and not isinstance(read, bool) and float(read) > 0
+
+
+def _timeout_seconds(timeout: Any, default: Optional[float] = None) -> Optional[float]:
+    """The generation budget behind a wire ``timeout`` (a float or an ``httpx.Timeout``).
+
+    Internal guards do arithmetic on this number — ``_aux_stream_total_ceiling``,
+    ``_anthropic_no_progress_timeout``, the Codex stream guard, the "timed out after Ns" log — and must
+    never receive the wire object. ``httpx.Timeout.read`` IS that budget; the connect cap is
+    deliberately invisible here.
+    """
+    if timeout is None:
+        return default
+    read = getattr(timeout, "read", None)
+    if isinstance(read, (int, float)) and not isinstance(read, bool):
+        return float(read)
+    try:
+        return float(timeout)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_call_kwargs(
     provider: str, model: str, messages: list, temperature: Optional[float] = None,
     max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
@@ -7404,7 +7482,7 @@ def _build_call_kwargs(
     ``no_progress_timeout`` is a Codex-Responses-only extra (consumed by
     ``_CodexCompletionsAdapter.create``'s ``**kwargs`` catch-all); callers must only pass it
     when the resolved client is a ``CodexAuxiliaryClient`` — real SDK clients don't accept it."""
-    kwargs: dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout}
+    kwargs: dict[str, Any] = {"model": model, "messages": messages, "timeout": _wire_timeout(timeout)}
     if no_progress_timeout is not None:
         kwargs["no_progress_timeout"] = no_progress_timeout
     effective_base = base_url or (_current_custom_base_url() if provider == "custom" else "")
@@ -7677,10 +7755,7 @@ _AUX_STREAM_CEILING_MULTIPLIER = 4.0
 def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
     """Absolute wall-clock bound for a streamed aux call; generous by design (the idle
     timeout is the real guard — this only stops a one-token-per-idle-window trickle)."""
-    try:
-        timeout = float(effective_timeout) if effective_timeout is not None else 0.0
-    except (TypeError, ValueError):
-        timeout = 0.0
+    timeout = _timeout_seconds(effective_timeout) or 0.0  # a wire httpx.Timeout carries the budget in .read
     return max(_AUX_STREAM_CEILING_FLOOR_SECONDS, _AUX_STREAM_CEILING_MULTIPLIER * timeout)
 
 
@@ -8579,13 +8654,20 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
             failed_provider or _classification_provider(sender, resolved_provider, route.main_runtime),
             base_url=sender_url or route.base_info)
     if reason == "request timed out":
-        # WARNING, naming the endpoint, the budget and the knob: the only other trace of a slow
-        # local model is the fallback provider's complaint about a model it never had (#89445).
+        # A CONNECT-phase stall names no knob: no connection was ever made, so raising the generation
+        # budget only lengthens the next stall. That misdirection is what sent six PM profiles chasing
+        # `auxiliary.<task>.timeout` after a dead edge (2026-11-23).
+        from agent.timeout_error_summary import _timeout_phase
         stalled = "Auxiliary chat stream" in str(first_err)
-        logger.warning("Auxiliary %s%s: request to %s %s (raise auxiliary.%s.%s for slow or reasoning "
-                       "models) on %s, trying fallback", task or "call", tag, route.base_info or resolved_provider,
-                       first_err if stalled else f"timed out after {route.timeout}s", task or "call",
-                       "no_progress_timeout" if stalled else "timeout", resolved_provider)
+        if not stalled and _timeout_phase(first_err) == "connect":
+            logger.warning("Auxiliary %s%s: could not connect to %s within %ss (connect/handshake cap, not "
+                           "the generation budget) on %s, trying fallback", task or "call", tag,
+                           route.base_info or resolved_provider, _AUX_CONNECT_TIMEOUT_SECONDS, resolved_provider)
+        else:
+            logger.warning("Auxiliary %s%s: request to %s %s (raise auxiliary.%s.%s for slow or reasoning "
+                           "models) on %s, trying fallback", task or "call", tag, route.base_info or resolved_provider,
+                           first_err if stalled else f"timed out after {route.timeout}s", task or "call",
+                           "no_progress_timeout" if stalled else "timeout", resolved_provider)
     else:
         logger.info("Auxiliary %s%s: %s on %s (%s), trying fallback",
                     task or "call", tag, reason, resolved_provider, first_err)
@@ -8660,7 +8742,7 @@ def _aux_recovery_ladder(
     route = _LadderRoute(
         client, task, tag, async_mode, base_info, resolved_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, final_model, main_runtime, route_info,
-        kwargs.get("timeout"))
+        _timeout_seconds(kwargs.get("timeout")))
     resp, first_err, kwargs, repairs = yield from _ladder_parameter_rungs(
         _failure(route, first_err), route, kwargs, max_tokens)
     if first_err is None:
@@ -8835,8 +8917,11 @@ def _should_retry_same_provider(task: Optional[str], failure: aux_errors.Failure
     if not aux_errors.same_provider_retry(failure.verdict):
         return False
     if _should_skip_same_provider_retry(task, failure):
-        logger.info("Auxiliary %s%s: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s", task, tag, failure.error)
+        logger.info("Auxiliary %s%s: %s; skipping same-provider retry and falling back: %s",
+                    task, tag,
+                    "no connection could be established" if _is_connect_phase_failure(failure)
+                    else "timeout on the critical path",
+                    failure.error)
         return False
     return True
 

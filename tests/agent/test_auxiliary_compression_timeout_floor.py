@@ -25,7 +25,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from agent.auxiliary_client import call_llm, async_call_llm
+from agent.auxiliary_client import call_llm, async_call_llm, _wire_timeout
 
 # The committed bounded floor for config-derived compression timeouts.
 # Behaviour contract (see AGENTS.md "Behavior contracts over snapshots"):
@@ -40,6 +40,18 @@ COMPRESSION_CONFIG_TIMEOUT = 120.0
 
 def _ok_response():
     return {"ok": True}
+
+
+def _budget(wire_timeout):
+    """The generation budget that reached ``create()``.
+
+    The request timeout is an ``httpx.Timeout``: ``read``/``write``/``pool`` carry this task's whole
+    budget while ``connect`` gets its own short cap (a stalled handshake must not consume the
+    generation budget). These tests are about the budget, so read it off the wire object.
+    """
+    assert wire_timeout.read == wire_timeout.write == wire_timeout.pool, wire_timeout
+    assert wire_timeout.connect <= 10.0, f"connect cap regressed into a total cap: {wire_timeout}"
+    return wire_timeout.read
 
 
 def _client_sync():
@@ -84,7 +96,7 @@ class TestCompressionTimeoutFloorSync:
                 task="compression",
                 messages=[{"role": "user", "content": "summarise this"}],
             )
-        timeout = client.chat.completions.create.call_args.kwargs["timeout"]
+        timeout = _budget(client.chat.completions.create.call_args.kwargs["timeout"])
         assert timeout >= COMPRESSION_TIMEOUT_FLOOR, (
             f"compression timeout {timeout} should be >= floor "
             f"{COMPRESSION_TIMEOUT_FLOOR}"
@@ -92,6 +104,8 @@ class TestCompressionTimeoutFloorSync:
         assert timeout > COMPRESSION_CONFIG_TIMEOUT, (
             "the too-low config timeout must not pass through unchanged"
         )
+        # The floor lands as the READ budget; the connect phase keeps its own short cap.
+        assert client.chat.completions.create.call_args.kwargs["timeout"] == _wire_timeout(timeout)
 
 
     def test_non_compression_task_is_not_floored(self):
@@ -105,7 +119,7 @@ class TestCompressionTimeoutFloorSync:
                 task="title_generation",
                 messages=[{"role": "user", "content": "x"}],
             )
-        timeout = client.chat.completions.create.call_args.kwargs["timeout"]
+        timeout = _budget(client.chat.completions.create.call_args.kwargs["timeout"])
         assert timeout == low, (
             f"non-compression task timeout must stay {low}, got {timeout}"
         )
@@ -124,7 +138,7 @@ class TestCompressionTimeoutFloorAsync:
                 task="compression",
                 messages=[{"role": "user", "content": "summarise this"}],
             )
-        timeout = client.chat.completions.create.call_args.kwargs["timeout"]
+        timeout = _budget(client.chat.completions.create.call_args.kwargs["timeout"])
         assert timeout >= COMPRESSION_TIMEOUT_FLOOR, (
             f"async compression timeout {timeout} should be >= floor "
             f"{COMPRESSION_TIMEOUT_FLOOR}"
@@ -141,7 +155,7 @@ class TestCompressionTimeoutFloorAsync:
                 messages=[{"role": "user", "content": "x"}],
                 timeout=explicit,
             )
-        timeout = client.chat.completions.create.call_args.kwargs["timeout"]
+        timeout = _budget(client.chat.completions.create.call_args.kwargs["timeout"])
         assert timeout == explicit
 
     @pytest.mark.asyncio
@@ -154,5 +168,5 @@ class TestCompressionTimeoutFloorAsync:
                 task="session_search",
                 messages=[{"role": "user", "content": "x"}],
             )
-        timeout = client.chat.completions.create.call_args.kwargs["timeout"]
+        timeout = _budget(client.chat.completions.create.call_args.kwargs["timeout"])
         assert timeout == low
