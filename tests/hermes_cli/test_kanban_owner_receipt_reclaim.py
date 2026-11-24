@@ -340,3 +340,72 @@ def test_an_earlier_runs_live_pid_does_not_hide_the_current_dead_run(board):
     board.event("t_ghost", run - 1, "spawned", {"pid": os.getpid()}, NOW - 100_000)
     board.conn.commit()
     assert [d.kind for d in board.diagnostics("t_ghost") if d.kind == "stale_running"] == ["stale_running"]
+
+
+# --- a FENCED admission (the owner's ``unknown``) is not a live attempt ----------------------
+#
+# Measured 2026-11-24: 31 refused dispatches ("Kanban execution unknown; retained by owner")
+# left their cards ``running`` behind an admission the owner had fenced ``unknown``. The fence is
+# never replayed — the row can only settle terminal or be discarded — so with every pid the
+# attempt ever had now dead, holding its claim until the TTL protects nothing.
+
+def test_a_fenced_admission_with_dead_pids_is_released_crashed_not_held(board):
+    """The fence used to hold the CRASH SWEEP too: the card sat ``running`` until its TTL.
+
+    A fenced admission is never replayed (the row can only settle terminal or be discarded), so
+    with every pid the attempt ever had now dead the sweep can book it. The claim is still VALID
+    here (it expires an hour out), which is the point: the TTL reclaim is not what releases it.
+    """
+    board.dead_attempt("t_fenced", admission=("unknown", None), expires_age_seconds=-3600)
+    assert owner_reclaim_paused(board.conn, "t_fenced") is True   # the fence still applies
+    assert owner_attempt_provably_over(board.conn, "t_fenced") is True
+    assert kb.release_stale_claims(board.conn) == 0               # ... and the TTL path is not it
+    assert kbd.detect_crashed_workers(board.conn) == ["t_fenced"]
+    row = board.state("t_fenced")
+    assert (row["status"], row["claim_lock"], row["worker_pid"]) == ("ready", None, None)
+
+
+@pytest.mark.parametrize("shape", [
+    dict(worker_pid=os.getpid(), worker_fingerprint=kbd._process_fingerprint(os.getpid())),
+    dict(worker_bound=True, worker_pid=os.getpid(),
+         worker_fingerprint=kbd._process_fingerprint(os.getpid())),
+    dict(record_worker_pid=False),
+], ids=["live-worker", "live-bound", "no-pid"])
+def test_a_fenced_admission_still_holds_a_maybe_live_attempt(board, shape):
+    board.dead_attempt("t_fenced", admission=("unknown", None), **shape)
+    assert owner_attempt_provably_over(board.conn, "t_fenced") is False
+    assert kb.release_stale_claims(board.conn) == 0
+    assert board.state("t_fenced")["status"] == "running"
+
+
+def test_the_attempts_own_result_under_a_live_claim_proves_it_ended(board):
+    """A settlement can lag its turn: the interpreter recorded the reply, every pid is gone."""
+    run = board.dead_attempt("t_ran", admission=("started", None), expires_age_seconds=-3600)
+    lock = board.state("t_ran")["claim_lock"]
+    board.event("t_ran", run, "worker_result",
+                {"pid": _absent_pid(base=3_800_000), "claim_lock": lock, "exit_code": 1}, NOW)
+    board.conn.commit()
+    assert owner_attempt_provably_over(board.conn, "t_ran") is True
+    assert kbd.detect_crashed_workers(board.conn) == ["t_ran"]
+    assert board.state("t_ran")["status"] == "ready"
+
+
+def test_another_claims_result_proves_nothing_about_this_attempt(board):
+    run = board.dead_attempt("t_ran", admission=("started", None), expires_age_seconds=-3600)
+    board.event("t_ran", run, "worker_result",
+                {"pid": _absent_pid(base=3_800_000), "claim_lock": "someone-else:1", "exit_code": 0}, NOW)
+    board.conn.commit()
+    assert owner_attempt_provably_over(board.conn, "t_ran") is False
+    assert kb.release_stale_claims(board.conn) == 0
+
+
+def test_a_result_pid_that_is_still_alive_keeps_the_claim(board):
+    """The interpreter that wrote the result is the last pid the attempt had: it must be dead too."""
+    run = board.dead_attempt("t_ran", admission=("started", None), expires_age_seconds=-3600)
+    lock = board.state("t_ran")["claim_lock"]
+    board.event("t_ran", run, "worker_result",
+                {"pid": os.getpid(), "claim_lock": lock, "exit_code": 0}, NOW)
+    board.conn.commit()
+    assert owner_attempt_provably_over(board.conn, "t_ran") is False
+    assert kb.release_stale_claims(board.conn) == 0
+    assert board.state("t_ran")["status"] == "running"

@@ -123,12 +123,32 @@ def _owner_process_gone(receipt) -> bool:
 
 
 def _run_worker_pids(conn, task_row, task_id):
-    """Every worker pid recorded for the task's current run, with its spawn fingerprint."""
+    """Every worker pid recorded for the task's current run, with its spawn fingerprint.
+
+    ``worker_result`` is included because it is written by the interpreter that ran the turn:
+    it is the last pid the attempt ever had, and leaving it out let a liveness check call a run
+    "all pids dead" while that interpreter was still winding down.
+    """
     recorded = [(task_row['worker_pid'], task_row['worker_started_at'])]
-    for kind in ('spawned', 'worker_bound'):
+    for kind in ('spawned', 'worker_bound', 'worker_result'):
         payload = _latest_run_event(conn, task_id, kind)
         recorded.append((payload.get('pid'), payload.get('started_at')))
     return [(int(pid), fingerprint) for pid, fingerprint in recorded if pid]
+
+
+def _run_worker_result(conn, task_id, claim_lock=None):
+    """The current run's ``worker_result`` payload when it names this run's claim, else ``{}``.
+
+    Its presence means the attempt's turn ENDED (the managed interpreter writes it in its own
+    finalizer, before the owner settles anything). Under a different claim it is a neighbour
+    attempt's reply and says nothing about this one.
+    """
+    payload = _latest_run_event(conn, task_id, 'worker_result')
+    if not payload:
+        return {}
+    if claim_lock is not None and payload.get('claim_lock') != claim_lock:
+        return {}
+    return payload
 
 
 def owner_attempt_provably_over(conn, task_id) -> bool:
@@ -142,16 +162,21 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     evidence the board already keeps:
 
       * the run never bound an interpreter (a bound run is the crash sweep's to book);
-      * every worker pid recorded for the run (``tasks.worker_pid``, its ``spawned`` and
-        ``worker_bound`` events) is dead or recycled;
-      * and the owner's own admission is SETTLED (``status='terminal'``) with at least one
-        recorded pid, or the host-local claim has EXPIRED with no heartbeat inside
-        ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` and the admission is settled or (pids
-        recorded) the owner's process is gone.
+      * every worker pid recorded for the run (``tasks.worker_pid``, its ``spawned``,
+        ``worker_bound`` and ``worker_result`` events) is dead or recycled;
+      * and the owner's own admission is SETTLED (``status='terminal'``) or FENCED
+        (``status='unknown'``) with at least one recorded pid, OR the run's own
+        ``worker_result`` under this claim says its turn ended, OR the host-local claim has
+        EXPIRED with no heartbeat inside ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` and the
+        admission is settled/fenced or (pids recorded) the owner's process is gone.
 
     A settled admission outranks the owner's liveness: the owner is usually the long-lived
     gateway, alive by design, and it settles a lost managed worker's admission without
-    extending the claim.
+    extending the claim. A FENCED (``unknown``) admission is just as final for this question:
+    ``mark_unknown`` is never replayed — the row can only settle terminal or be discarded — so
+    with every recorded pid dead it can no more start this attempt again than a terminal one
+    (measured 2026-11-24: 31 refused dispatches left their cards ``running`` on exactly this
+    fence, each held until its claim's TTL).
 
     Missing evidence is never proof: no receipt, a live pid whose identity cannot be
     compared, no recorded pid inside the claim's TTL, or an unreadable clock all return False
@@ -174,7 +199,12 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
         return False
     admission = _admission_row(receipt)
     settled = admission is not None and admission[0] == 'terminal'
-    if settled and pids:
+    fenced = admission is not None and admission[0] == 'unknown'
+    if (settled or fenced) and pids:
+        return True
+    if pids and _run_worker_result(conn, task_id, row['claim_lock']):
+        # The attempt's own interpreter recorded its reply and every pid it ever had is gone:
+        # whatever the owner's ledger still says, this attempt's turn is over.
         return True
     now = int(time.time())
     expires = kb._to_epoch(row['claim_expires'])

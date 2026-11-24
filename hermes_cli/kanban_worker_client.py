@@ -8,10 +8,12 @@ except ModuleNotFoundError as exc:
         raise
 
 import asyncio
+from contextlib import closing
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Optional
@@ -57,6 +59,135 @@ _FINAL_OWNER_REASONS = frozenset({'profile_mismatch', 'authorization', 'unsafe_c
                                   'invalid_api_origin'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
+
+# An owner that answers ``unknown`` has FENCED the receipt: its settlement write could not commit
+# (a held SQLite writer, a full disk), so the attempt can never be replayed. That is the owner's
+# answer about the ADMISSION, not about the card: an unattended card attempt is settled
+# ``interrupted`` by the owner's own drain right afterwards (``settle_unattended_unknown``), and
+# the attempt's managed interpreter normally records its ``worker_result`` before any of this.
+# Measured 2026-11-24: 31 of 90 runs crashed with this refusal, every inspected one after its
+# ``worker_result`` was already on the board — the card had run; only the receipt was unknown.
+# So an ``unknown`` receipt is not final: the attempt's own result (which ends the question), else
+# a bounded wait for the drain's resolution, decides first. 120 s covers a stalled owner loop
+# (measured 10 s+ event-loop stalls) without holding a card's slot for a claim TTL.
+UNKNOWN_RESOLUTION_GRACE_S = 120.0
+
+
+def _unknown_grace_s() -> float:
+    """``HERMES_KANBAN_UNKNOWN_GRACE_SECONDS`` (operator knob, 0 = never wait), else the default."""
+    raw = (os.environ.get('HERMES_KANBAN_UNKNOWN_GRACE_SECONDS') or '').strip()
+    if not raw:
+        return UNKNOWN_RESOLUTION_GRACE_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return UNKNOWN_RESOLUTION_GRACE_S
+
+
+def _attempt_result(board_db, params):
+    """This attempt's own ``worker_result`` event, or ``{}``.
+
+    The managed interpreter's finalizer writes it BEFORE the owner settles the admission, so it is
+    the strongest statement the board holds that this exact attempt's turn ended — under this run
+    id and this claim lock, never a neighbour attempt's (``worker_result`` enforces both). When the
+    owner then fails to commit its settlement and fences the receipt ``unknown``, refusing the card
+    on that fence alone libels an attempt that ran: its reply is right here.
+    """
+    try:
+        from gateway.session_kanban import worker_result
+        return worker_result(board_db, params) or {}
+    except (OSError, ValueError, sqlite3.Error):
+        return {}
+
+
+def _task_boards(task_id: str, db_path: str, board: Optional[str]) -> list[tuple[str, str]]:
+    """``[(slug, path)]`` of every board whose OWN ``kanban.db`` holds this card.
+
+    A refusal that names only ``resolved_board`` cannot be diagnosed when the card lives in
+    another board's file — the exact cross-lane shape that killed t_a6bccd8c / t_a43541ef. The
+    resolved board is probed first (the normal case: one hit), then every sibling board, then the
+    root ``default`` file, all read-only.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+        root, default_db = kb.boards_root(), kb.kanban_home() / 'kanban.db'
+    except Exception:
+        root, default_db = None, None
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def probe(slug: str, path) -> None:
+        try:
+            db_file = str(Path(path).resolve())
+        except OSError:
+            return
+        if db_file in seen or not Path(db_file).is_file():
+            return
+        seen.add(db_file)
+        try:
+            with closing(sqlite3.connect(Path(db_file).as_uri() + '?mode=ro', uri=True)) as conn:
+                if conn.execute('SELECT 1 FROM tasks WHERE id = ?', (task_id,)).fetchone():
+                    found.append((slug, db_file))
+        except sqlite3.Error:
+            return  # unreadable is not "holds the card"
+
+    probe(board or 'default', db_path)
+    if root is not None:
+        try:
+            for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+                if child.is_dir() and (child / 'kanban.db').is_file():
+                    probe(child.name, child / 'kanban.db')
+        except OSError:
+            pass
+    if default_db is not None:
+        probe('default', default_db)
+    return found
+
+
+def _refusal_record(params, board_db, claim) -> dict:
+    """Everything a reader needs to place a refused dispatch: boards, DB, claim, admission."""
+    try:
+        db_path = str(Path(board_db).resolve())
+    except OSError:
+        db_path = str(board_db)
+    boards = _task_boards(params['task_id'], db_path, params.get('board'))
+    return {
+        'reason': 'owner answered unknown: the attempt settlement could not be committed',
+        'resolved_board': params.get('board'), 'card_board': [slug for slug, _ in boards] or None,
+        'card_board_path': boards[0][1] if boards else None, 'db_path': db_path,
+        'claim_id': params.get('claim_lock'), 'run_id': params.get('run_id'),
+        'task_id': params.get('task_id'), 'session_id': getattr(claim, 'session_id', None),
+        'admission_id': getattr(claim, 'admission_id', None), 'pid': os.getpid(),
+    }
+
+
+def _refusal_sentence(record: dict) -> str:
+    """The one line the worker prints, keeping the old prefix a grep already knows."""
+    card = ','.join(record['card_board'] or ['unknown'])
+    return ('Kanban execution unknown; retained by owner '
+            f"[resolved_board={record['resolved_board']}; card_board={card}; db_path={record['db_path']}; "
+            f"claim_id={record['claim_id']}; run_id={record['run_id']}; session_id={record['session_id']}; "
+            f"admission_id={record['admission_id']}]")
+
+
+def _record_refusal(record: dict) -> None:
+    """Write the refusal onto the card itself, so it outlives this process's stderr.
+
+    The dispatcher folds only the worker's LAST OUTPUT into the crashed event; the refusal used to
+    name no board, DB or claim, which made this whole class guesswork. Written to the file that
+    actually HOLDS the card (``card_board_path``) when the resolved board is a different one —
+    an event for a task id the resolved DB has never heard of would be a row nobody can join.
+    Best-effort: a refusal must still exit when the board cannot be written (that is often why we
+    are here).
+    """
+    try:
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli import kanban_db as kb
+        db_path = record.get('card_board_path') or record['db_path']
+        with connect_closing(Path(db_path)) as conn, kb.write_txn(conn):
+            kb._append_event(conn, record['task_id'], 'dispatch_refused', record, run_id=record['run_id'])
+    except Exception:
+        pass
 
 
 def admission_answer_budget():
@@ -132,7 +263,7 @@ async def run(params, board_db):
                 raise GatewayClientError(
                     f'Kanban owner silent for {claim.silent_for():.0f}s: {detail}{restarted}') from exc
         else:
-            return _exit_code(receipt, params, board_db, planned_restart=restart_at is not None)
+            return _exit_code(receipt, params, board_db, planned_restart=restart_at is not None, claim=claim)
         failures = 1 if claim.answered != seen else failures + 1
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
@@ -224,19 +355,36 @@ async def _await_receipt(client, params, board_db, claim):
     else:
         receipt = await _receipt(client, claim)
     claim.answered = time.monotonic()
-    while receipt['status'] not in {'terminal', 'unknown'}:
+    # ``unknown`` is the owner's fence around an admission it could not settle — never a replay, but
+    # also not yet an answer about the CARD: its drain settles an unattended (kanban) admission
+    # interrupted right afterwards, and the attempt's own ``worker_result`` outranks both. Wait for
+    # whichever comes first, bounded by ``_unknown_grace_s()``.
+    grace = _unknown_grace_s()
+    fenced_at = None
+    while True:
+        if receipt['status'] == 'terminal':
+            return receipt
+        if receipt['status'] == 'unknown':
+            if _attempt_result(board_db, params):
+                return receipt
+            fenced_at = fenced_at or time.monotonic()
+            if grace <= 0 or time.monotonic() - fenced_at >= grace:
+                return receipt
         await asyncio.sleep(.2)
         receipt = await _receipt(client, claim)
         claim.answered = time.monotonic()
-    return receipt
 
 
-def _exit_code(receipt, params, board_db, *, planned_restart=False):
+def _exit_code(receipt, params, board_db, *, planned_restart=False, claim=None):
     from hermes_cli.gateway_client import GatewayClientError
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
-    from gateway.session_kanban import worker_result
-    result = worker_result(board_db, params)
+    result = _attempt_result(board_db, params)
+    if receipt['status'] == 'unknown' and not result:
+        # Nothing on the board says this attempt's turn ended, and the owner fenced the receipt:
+        # refuse, but say WHERE we looked and WHAT we held. Best-effort board record first, so the
+        # refusal survives this process's stderr.
+        record = _refusal_record(params, board_db, claim)
+        _record_refusal(record)
+        raise GatewayClientError(_refusal_sentence(record))
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])
@@ -276,8 +424,11 @@ def _submit():
         board_db = os.environ['HERMES_KANBAN_DB']
         # Owner startup must never inherit this worker's task/tool/goal identity.
         for key in list(os.environ):
-            # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.
-            if key.startswith('HERMES_KANBAN_') and key not in ('HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS'):
+            # The busy timeout and the unknown-receipt grace are host tuning knobs, not task
+            # identity: the answer budget and ``_unknown_grace_s`` read them from this env.
+            if key.startswith('HERMES_KANBAN_') and key not in (
+                    'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS',
+                    'HERMES_KANBAN_UNKNOWN_GRACE_SECONDS'):
                 os.environ.pop(key)
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
