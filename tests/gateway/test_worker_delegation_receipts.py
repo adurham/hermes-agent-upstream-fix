@@ -6,14 +6,23 @@ import psutil
 import pytest
 
 from hermes_cli.process_identity import worker_birth
-from agent.runtime_session_store import RuntimeSessionStore
+from agent.runtime_session_store import RuntimeSessionStore, WorkerReceiptTimeout
 from persistence.core.errors import AuthorityRefusal
 from tests.fixtures.storage_holder import raw_holder
 from tests.fixtures.storage_seed import seed_session
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
-def test_lost_ack_reopens_owner_and_replays_same_ledger_receipt(tmp_path):
+def test_lost_ack_reopens_owner_and_replays_same_ledger_receipt(tmp_path, monkeypatch):
+    """A lost ACK whose resolve window is exhausted stays journalled; a restart replays it exactly.
+
+    The in-place resolve (an owner that answers nothing is replayed while it is still live) is
+    covered in tests/persistence_sqlite/workers/test_worker_receipt_resolution.py. This case is
+    the other half: the owner is GONE before the entry can be resolved, so the entry must survive
+    the restart, refuse a stale epoch, and land exactly once after adoption.
+    """
+    import agent.runtime_session_store as _rss
+    monkeypatch.setattr(_rss, '_RECEIPT_RESOLVE_S', 0.0)
     from gateway.session_worker_delegation import persist_worker_delegation
     db = storage_handle(tmp_path)
     seed_session(db, 'parent', 'cli')
@@ -29,7 +38,7 @@ def test_lost_ack_reopens_owner_and_replays_same_ledger_receipt(tmp_path):
         pid, birth = params.pop('pid'), params.pop('birth')
         result = persist_worker_delegation(handle, **params, worker_pid=pid, worker_birth=birth)
         if lost.pop() if lost else False:
-            raise TimeoutError('lost_ack')
+            raise WorkerReceiptTimeout('lost_ack')
         return result
     store = RuntimeSessionStore(rpc, scope, tmp_path / 'outbox')
     try:

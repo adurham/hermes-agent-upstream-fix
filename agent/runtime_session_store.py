@@ -16,9 +16,20 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
+
+# How long one pending journal entry may stay unresolved after the owner stops answering.
+# The receipt budget alone is not the bound: a gateway event loop can stall for tens of seconds
+# (``tui_gateway.ws`` logs "ws write slow (loop stalled >...s)" and has been observed at 80.7 s),
+# and the redial that follows needs that same loop to complete a handshake. 90 s is above the
+# owner's own transcript patience (``_TRANSCRIPT_WRITE_PATIENCE_S`` = 60 s), so the client never
+# gives up before the server is still allowed to answer.
+_RECEIPT_RESOLVE_S = 90.0
+# Pause between replays of one entry; grows with the attempt so a stalled loop is not hammered.
+_RECEIPT_RETRY_PAUSE_S = 0.5
 
 _worker_process = False
 
@@ -45,6 +56,34 @@ def apply_row_annotations(messages, annotations):
 
 class WorkerPersistenceError(RuntimeError):
     pass
+
+
+class WorkerReceiptTimeout(TimeoutError):
+    """The owner never answered one receipt within its budget — the write's outcome is UNKNOWN.
+
+    Not a refused write: the journal entry is still pending, and ``worker.persist`` is idempotent
+    per (execution, sequence, payload digest), so replaying that same entry resolves it — the
+    owner returns the stored receipt if it landed, or applies it now. Distinguishing this from a
+    refusal is what keeps a stalled owner from killing a turn that could still be saved.
+    """
+
+
+def _owner_unanswered(exc: BaseException) -> bool:
+    """True when the owner gave no answer at all, so an idempotent replay can still resolve it.
+
+    ``WorkerPersistenceError`` is excluded on purpose: that is what an owner *response* becomes
+    (an error frame) and what a missing owner becomes (``owner_unavailable``). Neither is a lost
+    ACK, and neither gets better by resending.
+    """
+    if isinstance(exc, WorkerPersistenceError):
+        return False
+    if isinstance(exc, (TimeoutError, OSError)):  # receipt budget, open/handshake timeout, dead socket
+        return True
+    try:
+        from websockets.exceptions import WebSocketException
+    except Exception:  # health: allow BLE001 -- a missing websockets is handled where it is used
+        return False
+    return isinstance(exc, WebSocketException)  # ConnectionClosed, InvalidHandshake, ...
 
 
 def _caller_summary(limit=8):
@@ -109,7 +148,7 @@ class _OwnerLink:
         try:
             reply = self.replies.get(timeout=timeout)
         except queue.Empty:
-            raise TimeoutError('worker_receipt_timeout') from None
+            raise WorkerReceiptTimeout('worker_receipt_timeout') from None
         if isinstance(reply, BaseException):
             raise reply
         return reply
@@ -196,7 +235,10 @@ class WorkerRPC:
                     link.send(request_id, message)
                 response = link.receive(20)
             except BaseException:
-                # Outcome unknown once sent: surface the error and never resend; the next call redials.
+                # Outcome unknown once sent: surface the error and never resend HERE — the
+                # transport cannot tell an idempotent persist from register/adopt. Resending a
+                # receipted operation is the journal's job, where the (execution, sequence,
+                # digest) key makes the replay exactly-once: see RuntimeSessionStore._send_entry.
                 self._drop()
                 raise
             if 'error' in response:
@@ -330,13 +372,48 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.journal = candidate
             return self.retry_pending()[0]
 
+    def _send_entry(self, entry):
+        """Send one pending journal entry, resolving a lost ACK instead of guessing at it.
+
+        Every entry the journal holds is a ``worker.persist`` operation carrying its own
+        ``sequence``, and the owner's receipt transaction is keyed on
+        ``(execution_id, sequence)`` + ``payload_digest``: an exact replay returns the stored
+        result instead of applying the write twice. "No answer from the owner" therefore means
+        the outcome is UNKNOWN, never that the write failed — and replaying the identical entry
+        is what settles which. Latching it as a failure instead killed the turn *and* every later
+        write in it (``self.failure`` is sticky), which is how a gateway whose event loop stalled
+        past the receipt budget surfaced to the user as "Hermes couldn't save this conversation"
+        even though the write could still land.
+
+        Only an unanswered send is replayed. An owner response is terminal — a stored result, an
+        error frame (``stale_epoch``, ``admission_conflict``, ``stale_generation``), or
+        ``owner_unavailable`` when there is no owner to answer — so a dead gateway still fails
+        fast instead of waiting out the window.
+        """
+        deadline = time.monotonic() + _RECEIPT_RESOLVE_S
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self.rpc('worker.persist', **self.scope, **entry)
+            except Exception as exc:  # health: allow BLE001 -- non-answers are re-raised below
+                if not _owner_unanswered(exc) or time.monotonic() >= deadline:
+                    raise
+                logger.warning(
+                    'worker receipt unresolved for execution %s sequence %s (%s: %s); '
+                    'replaying the same entry (attempt %d, %s operation)',
+                    self.scope.get('execution_id'), entry.get('sequence'),
+                    type(exc).__name__, exc, attempt + 1, entry.get('operation'))
+                time.sleep(min(_RECEIPT_RETRY_PAUSE_S * attempt,
+                               max(0.0, deadline - time.monotonic())))
+
     def retry_pending(self):
         with self.lock:
             results = []
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._send_entry(entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
