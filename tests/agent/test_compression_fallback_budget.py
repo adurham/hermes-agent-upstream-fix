@@ -21,7 +21,11 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.auxiliary_client import _fallback_entry_timeout, _call_fallback_candidate_sync
+from agent.auxiliary_client import (
+    _AUX_CONNECT_TIMEOUT_SECONDS,
+    _fallback_entry_timeout,
+    _call_fallback_candidate_sync,
+)
 from agent.context_compressor import ContextCompressor
 
 
@@ -67,7 +71,14 @@ def test_fallback_candidate_call_uses_entry_timeout():
             effective_extra_body={}, reasoning_config=None,
         )
     assert resp is not None
-    assert seen.get("timeout") == 240.0
+    # The entry's budget lands as the READ budget; the connect phase keeps its own short cap, so a
+    # stalled handshake on the fallback endpoint cannot re-burn the entry's timeout either.
+    wire = seen.get("timeout")
+    assert wire is not None, "the fallback request carried no timeout"
+    assert wire.read == 240.0
+    assert wire.write == wire.pool == 240.0
+    assert wire.connect == _AUX_CONNECT_TIMEOUT_SECONDS
+    assert wire.read != 30.0  # not the primary's burned budget
 
 
 
