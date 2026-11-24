@@ -238,3 +238,118 @@ def test_dispatch_critical_pressure_still_runs_reclaim_bookkeeping(
     assert res.memory_pressure == "critical"
     assert row is not None
     assert row.status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Worker-slice pressure (aggregate saturation the host reading cannot see)
+#
+# 2026-11-24: every managed worker is charged to the shared
+# hermes-workers.slice. It sat pegged at its memory.max and the kernel logged
+# 114-129 oom-kills in 30 minutes while the HOST reading was "ok" (18 GiB of
+# 61 GiB available, 29%). Victims died at 0.4-1.2 GiB against their own 6 GiB
+# per-worker cap, so the deaths were aggregate saturation, not fat cards. The
+# host-only guard spawned straight into the kill line.
+# ---------------------------------------------------------------------------
+
+SLICE = "hermes-workers.slice"
+OWN_SCOPE = (
+    "user.slice/user-1000.slice/user@1000.service/hermes.slice/"
+    f"{SLICE}/hermes-worker-managed-4242-abcd.scope"
+)
+
+
+def _fake_slice(root: Path, current: int, cap) -> Path:
+    """Build a fake cgroup hierarchy holding one slice; return the slice dir."""
+    slice_dir = (
+        root / "user.slice" / "user-1000.slice" / "user@1000.service"
+        / "hermes.slice" / SLICE
+    )
+    slice_dir.mkdir(parents=True, exist_ok=True)
+    (slice_dir / "memory.max").write_text(str(cap), encoding="utf-8")
+    (slice_dir / "memory.current").write_text(str(current), encoding="utf-8")
+    return slice_dir
+
+
+def _point_worker_cgroup_at(monkeypatch, root: Path, own: str = OWN_SCOPE) -> None:
+    from hermes_cli import worker_cgroup as wc
+
+    monkeypatch.setattr(wc, "CGROUP_ROOT", root)
+    monkeypatch.setattr(wc, "own_cgroup_path", lambda: "/" + own)
+
+
+@pytest.mark.real_memory_guard
+def test_slice_pressure_is_ok_when_slice_has_headroom(tmp_path, monkeypatch):
+    _fake_slice(tmp_path, current=2 * GIB, cap=10 * GIB)
+    _point_worker_cgroup_at(monkeypatch, tmp_path)
+    assert kbd._worker_slice_pressure_level() == "ok"
+
+
+@pytest.mark.real_memory_guard
+def test_slice_pressure_elevated_at_three_quarters(tmp_path, monkeypatch):
+    _fake_slice(tmp_path, current=8 * GIB, cap=10 * GIB)
+    _point_worker_cgroup_at(monkeypatch, tmp_path)
+    assert kbd._worker_slice_pressure_level() == "elevated"
+
+
+@pytest.mark.real_memory_guard
+def test_slice_pressure_critical_when_pegged(tmp_path, monkeypatch):
+    """The production shape: current == memory.max."""
+    _fake_slice(tmp_path, current=24 * GIB, cap=24 * GIB)
+    _point_worker_cgroup_at(monkeypatch, tmp_path)
+    assert kbd._worker_slice_pressure_level() == "critical"
+
+
+def test_slice_pressure_unknown_without_a_slice(tmp_path, monkeypatch):
+    """No slice (macOS/Windows, no systemd) must fail open, not read as fine."""
+    _point_worker_cgroup_at(monkeypatch, tmp_path, own="user.slice/session-1.scope")
+    assert kbd._worker_slice_pressure_level() == "unknown"
+
+
+def test_slice_pressure_unknown_when_unreadable(tmp_path, monkeypatch):
+    slice_dir = _fake_slice(tmp_path, current=1, cap=1024 * GIB)
+    (slice_dir / "memory.current").unlink()
+    _point_worker_cgroup_at(monkeypatch, tmp_path)
+    assert kbd._worker_slice_pressure_level() == "unknown"
+
+
+@pytest.mark.real_memory_guard
+def test_slice_pressure_ok_when_slice_is_unlimited(tmp_path, monkeypatch):
+    _fake_slice(tmp_path, current=99 * GIB, cap="max")
+    _point_worker_cgroup_at(monkeypatch, tmp_path)
+    assert kbd._worker_slice_pressure_level() == "ok"
+
+
+@pytest.mark.real_memory_guard
+def test_slice_paths_found_from_outside_the_slice(tmp_path, monkeypatch):
+    """The gateway spawns from outside the slice: it must find it in the tree."""
+    slice_dir = _fake_slice(tmp_path, current=1, cap=1024 * GIB)
+    _point_worker_cgroup_at(monkeypatch, tmp_path, own="user.slice/session-9.scope")
+    assert slice_dir in kbd.worker_slice_paths()
+
+
+def test_worse_pressure_takes_the_most_restrictive():
+    assert kbd._worse_pressure("ok", "critical") == "critical"
+    assert kbd._worse_pressure("unknown", "elevated") == "elevated"
+    assert kbd._worse_pressure("unknown", "unknown") == "unknown"
+    assert kbd._worse_pressure("ok", "unknown") == "ok"
+
+
+def test_dispatch_defers_when_only_the_slice_is_critical(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Host "ok" + slice "critical" must still spawn nothing.
+
+    This is the regression: before the slice reading existed, a pegged worker
+    slice was invisible to dispatch and it kept spawning into the kill line.
+    """
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda *a, **k: "ok")
+    monkeypatch.setattr(kbd, "_worker_slice_pressure_level", lambda *a, **k: "critical")
+    spawns = []
+
+    with kbc.connect() as conn:
+        for title in ("a", "b"):
+            kb.create_task(conn, title=title, assignee="alice")
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42)
+
+    assert not spawns
+    assert res.memory_pressure == "critical"

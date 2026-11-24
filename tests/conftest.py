@@ -505,6 +505,10 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(_kbd_mod, "_system_memory_sample", dict, raising=False)
+    # Same reasoning for the worker-slice reading: it inspects the host's cgroup
+    # hierarchy, so a developer box with a pegged ``hermes-workers.slice`` would
+    # otherwise throttle spawns inside unrelated tests.
+    monkeypatch.setattr(_kbd_mod, "_worker_slice_pressure_level", lambda *a, **k: "unknown", raising=False)
 
 
 @pytest.fixture(autouse=True)

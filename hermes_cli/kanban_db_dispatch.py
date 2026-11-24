@@ -24,6 +24,7 @@ from typing import Iterable
 from typing import Iterator
 from typing import Mapping
 from typing import Optional
+from typing import Sequence
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
@@ -2255,6 +2256,93 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+#: Ordering for composing two independent pressure readings — take the worse.
+_PRESSURE_RANK = {"unknown": 0, "ok": 1, "elevated": 2, "critical": 3}
+
+#: Fraction of the worker slice's ``memory.max`` at which dispatch throttles. The
+#: slice is the kill line for every managed worker, and the HOST reading cannot
+#: see it: on 2026-11-24 this box reported ``pressure="ok"`` (18 GiB of 61 GiB
+#: available, 29%) while ``hermes-workers.slice`` sat pegged at its 24 GiB cap and
+#: the kernel logged 114-129 oom-kills in 30 minutes. Every victim died at
+#: 0.4-1.2 GiB against its own 6 GiB per-worker cap, i.e. the deaths were
+#: aggregate saturation, not a fat card — nothing in the host reading predicts it.
+_SLICE_PRESSURE_ELEVATED_FRACTION = 0.75
+_SLICE_PRESSURE_CRITICAL_FRACTION = 0.90
+
+
+def worker_slice_paths() -> list[Path]:
+    """Candidate cgroup dirs for the managed-worker slice; ``[]`` when unknown.
+
+    Two callers with different vantage points: a worker asking about its own
+    fleet finds the slice as an ancestor of its cgroup, while the gateway (the
+    process that actually spawns) sits outside the slice and must find it in the
+    systemd hierarchy. Both are cheap sysfs reads.
+    """
+    try:
+        from hermes_cli.worker_cgroup import CGROUP_ROOT, DEFAULT_SLICE, own_cgroup_path
+    except Exception:
+        return []
+    found: list[Path] = []
+    own = own_cgroup_path()
+    if own:
+        parts = own.strip("/").split("/")
+        for index, part in enumerate(parts, start=1):
+            if part == DEFAULT_SLICE:
+                found.append(CGROUP_ROOT / "/".join(parts[:index]))
+                break
+    for top in ("user.slice", "system.slice"):
+        for pattern in (f"*/*/{DEFAULT_SLICE}", f"*/*/*/{DEFAULT_SLICE}"):
+            try:
+                found.extend(sorted((CGROUP_ROOT / top).glob(pattern)))
+            except OSError:
+                continue
+    return found
+
+
+def _worker_slice_pressure_level(paths: Optional[Sequence[Path]] = None) -> str:
+    """Classify the worker slice's own occupancy: ok/elevated/critical/unknown.
+
+    ``unknown`` (no slice — macOS/Windows, no systemd, unreadable) imposes no
+    restriction, same fail-open contract as :func:`_memory_pressure_level`:
+    a missing measurement must never read as "fine".
+    """
+    worst = "unknown"
+    for path in (paths if paths is not None else worker_slice_paths()):
+        try:
+            raw_max = (path / "memory.max").read_text(encoding="utf-8-sig").strip()
+            current = int((path / "memory.current").read_text(encoding="utf-8-sig").strip())
+        except (OSError, ValueError):
+            continue
+        if raw_max == "max":  # unlimited slice: nothing to saturate
+            level = "ok"
+        else:
+            try:
+                cap = int(raw_max)
+            except ValueError:
+                continue
+            if cap <= 0:
+                continue
+            fraction = current / cap
+            if fraction >= _SLICE_PRESSURE_CRITICAL_FRACTION:
+                level = "critical"
+            elif fraction >= _SLICE_PRESSURE_ELEVATED_FRACTION:
+                level = "elevated"
+            else:
+                level = "ok"
+        if _PRESSURE_RANK[level] > _PRESSURE_RANK[worst]:
+            worst = level
+    return worst
+
+
+def _worse_pressure(*levels: str) -> str:
+    """The most restrictive of several pressure readings (worst wins)."""
+    worst = "unknown"
+    for level in levels:
+        if _PRESSURE_RANK.get(level, 0) > _PRESSURE_RANK[worst]:
+            worst = level
+    return worst
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -2521,11 +2609,17 @@ def _tick_spawn_budget(
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
     # Reclaim/promotion already ran, so bookkeeping stays live; deferred tasks
     # wait for a later tick. "unknown" imposes no restriction.
-    pressure = _memory_pressure_level()
+    #
+    # Two readings, worst wins. The host reading alone is blind to the failure
+    # that actually kills workers: every managed worker is charged to the shared
+    # ``hermes-workers.slice``, which the kernel kills inside at its own
+    # ``memory.max`` while the host still reports tens of GiB available — 114
+    # oom-kills in 30 min were logged at host pressure "ok" (2026-11-24).
+    pressure = _worse_pressure(_memory_pressure_level(), _worker_slice_pressure_level())
     if pressure == "critical":
         result.memory_pressure = pressure
         _kb._log.warning(
-            "kanban dispatch: system memory pressure is critical; "
+            "kanban dispatch: memory pressure is critical (host or worker slice); "
             "spawning no new workers this tick (deferred, not dropped)"
         )
         return False, None
@@ -2533,7 +2627,7 @@ def _tick_spawn_budget(
         result.memory_pressure = pressure
         if spawn_budget is None or spawn_budget > 1:
             _kb._log.warning(
-                "kanban dispatch: system memory pressure is elevated; "
+                "kanban dispatch: memory pressure is elevated (host or worker slice); "
                 "limiting to at most 1 new worker this tick"
             )
             spawn_budget = 1

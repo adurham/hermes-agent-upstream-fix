@@ -37,6 +37,11 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         # The fresh copy re-reads the host's live memory pressure: re-apply the neutralizer the
         # conftest patched onto the session's module so the host's pressure cannot cap this tick.
         monkeypatch.setattr(kanban_db_dispatch, "_system_memory_sample", dict)
+        # Same for the worker-slice reading: a saturated hermes-workers.slice on the
+        # developer's box must not silently stop this tick from spawning.
+        monkeypatch.setattr(
+            kanban_db_dispatch, "_worker_slice_pressure_level", lambda *a, **k: "unknown",
+        )
         yield kanban_db
 
 
