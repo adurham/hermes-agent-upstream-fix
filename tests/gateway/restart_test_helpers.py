@@ -8,7 +8,9 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT,
     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+    DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT,
 )
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -77,6 +79,10 @@ def make_restart_runner(
     runner._restart_command_source = None
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._restart_after_turn_timeout = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+    runner._restart_wait_timeout = DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT
+    runner._update_restart_wait_timeout = DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT
+    runner._restart_wait_bound = 0.0
+    runner._restart_backstop_armed = False
     runner._cron_drain_timeout = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     runner._signal_interrupt_grace_timeout = (
         DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT

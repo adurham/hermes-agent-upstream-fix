@@ -202,7 +202,7 @@ Sessions and messages created after the update are not in that snapshot.
 
 ### Why the gateway restart can take a while
 
-The restart happens when the gateway is idle: the running gateway keeps serving normally (new turns, background-process notices and background-subagent completions all still run) and exits at the first moment no work is in flight (chat turns, cron jobs, API runs, background subagents, notify-watched background processes). Live work is never interrupted on a timer: every `agent.restart_after_turn_timeout` seconds (30 minutes by default) the gateway logs a warning naming what it is still waiting on and keeps waiting; only a forced restart stops it. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
+The restart happens when the gateway is idle: the running gateway keeps serving normally (new turns, background-process notices and background-subagent completions all still run) and exits at the first moment no work is in flight (chat turns, cron jobs, API runs, background subagents, notify-watched background processes). Every `agent.restart_after_turn_timeout` seconds (30 minutes by default) the gateway logs a warning naming what it is still waiting on and keeps waiting. The wait is bounded by `agent.update_restart_wait_timeout` (30 minutes by default, deliberately long so an update is never forced mid-write): at that bound the gateway names what it is interrupting, sends one line to the home channel, stops that work and exits, so the update always lands. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
 
 ```
   → hermes-gateway: draining (up to 1875s)...

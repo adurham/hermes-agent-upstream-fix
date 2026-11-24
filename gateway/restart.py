@@ -48,6 +48,14 @@ DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT = 5.0
 # ``restart_drain_timeout``, the force-interrupt budget once ``stop()`` runs (short under TimeoutStopSec).
 DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_after_turn_timeout"])
 
+# Hard bound on the in-band restart's wait-for-idle, independent of the warning interval above. A
+# user-initiated restart must converge even when a holder never goes idle; when the bound expires the
+# gateway names the units, tells the owner, stops live work and restarts (restart_when_idle.await_idle).
+DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_wait_timeout"])
+# The bound for an update pause: an update must not be forced mid-write, so it is much longer
+# (and separately configurable) than a plain restart's.
+DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT = float(DEFAULT_CONFIG["agent"]["update_restart_wait_timeout"])
+
 # Floor under the ``stop()`` drain for cron jobs and api_server (/v1) runs. ``restart_drain_timeout``
 # defaults to 0 because interrupting a *chat* turn is cheap and recoverable (user told, session
 # resume_pending); an interrupted *cron* run is a permanent failure in jobs.json and an interrupted
@@ -305,6 +313,16 @@ def parse_restart_drain_timeout(raw: object) -> float:
 def parse_restart_after_turn_timeout(raw: object) -> float:
     """Parse the after-turn wait cap for in-band restart (``0`` = legacy immediate drain)."""
     return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT)
+
+
+def parse_restart_wait_timeout(raw: object) -> float:
+    """Parse the hard bound on the in-band restart's wait-for-idle (``0`` = never force)."""
+    return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT)
+
+
+def parse_update_restart_wait_timeout(raw: object) -> float:
+    """Parse the update pause's own wait-for-idle bound (``0`` = never force)."""
+    return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT)
 
 
 def parse_cron_drain_timeout(raw: object) -> float:

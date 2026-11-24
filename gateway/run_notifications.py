@@ -567,6 +567,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
         return delivered
 
+    async def _notify_home_channels_restart_forced(self, message: str) -> bool:
+        """One line per served home channel: the restart's wait bound expired and live work is being
+        stopped so the restart can converge. Best-effort — a home that cannot be reached costs the
+        line, never the restart (the gateway's WARNING is the durable record)."""
+        delivered = False
+        for _profile, platform, _platform_cfg, home, transport in self._served_home_channel_transports():
+            if await self._send_home_channel_message(
+                platform, home, transport, message,
+                "Forced-restart notice failed for %s:%s: %s",
+            ):
+                delivered = True
+                logger.info("Sent forced-restart notice to %s:%s", platform.value, home.chat_id)
+        return delivered
+
     async def _send_session_db_warning_notifications(self) -> None:
         """Broadcast a state.db failure warning to all home channels.
 

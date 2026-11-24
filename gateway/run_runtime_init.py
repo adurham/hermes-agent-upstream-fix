@@ -29,6 +29,11 @@ class GatewayRuntimeInitMixin:
         self._stop_requested_by_signal = False
         self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(self._restart_drain_timeout)
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
+        # The bound that ends the wait (and stops live work) when a restart never goes idle. The
+        # per-request default lives on the class; request_service_restart swaps in the update bound.
+        self._restart_wait_timeout = self._load_restart_wait_timeout()
+        self._update_restart_wait_timeout = self._load_update_restart_wait_timeout()
+        self._restart_wait_bound = 0.0
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
         self._provider_routing = self._load_provider_routing()

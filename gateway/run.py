@@ -2187,7 +2187,9 @@ from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
-    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT)
+    DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT,
+    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+    DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT)
 
 
 logger = logging.getLogger(__name__)
@@ -3318,6 +3320,12 @@ class GatewayRunner(
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+    _restart_wait_timeout: float = DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT
+    _update_restart_wait_timeout: float = DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT
+    # What THIS wait is bounded by: request_restart stamps the restart bound, request_service_restart
+    # the (longer) update one. 0 = unbounded (the pre-bound behaviour).
+    _restart_wait_bound: float = 0.0
+    _restart_backstop_armed: bool = False
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     _signal_interrupt_grace_timeout: float = DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
     _exit_code: Optional[int] = None

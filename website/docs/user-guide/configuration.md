@@ -1284,7 +1284,15 @@ agent:
   restart_drain_timeout: 0          # default: interrupt in-flight chat turns at once
   cron_drain_timeout: 30            # floor for cron jobs and api_server (/v1) runs
   restart_after_turn_timeout: 1800  # /restart and `gateway restart` restart when idle; warn (never interrupt) every N s
+  restart_wait_timeout: 120         # ...and at this bound log what it interrupts, stop it, and restart
+  update_restart_wait_timeout: 1800 # the same bound for an update pause (never force one mid-write)
 ```
+
+`restart_wait_timeout` is the hard bound on the wait-for-idle: a restart you asked for always
+converges, even when a holder never goes idle. When it expires the gateway logs a WARNING naming
+every unit, sends one line to the home channel, stops that work and exits for the supervisor to
+relaunch. Before the bound nothing is interrupted — `restart_after_turn_timeout` remains the warning
+interval. Set either bound to `0` to keep the old unbounded wait.
 
 With the default `0`, a restart interrupts a running turn immediately. The turn settles as
 interrupted and is never run again; the TUI and Desktop show a "Gateway restarting" (or "Gateway

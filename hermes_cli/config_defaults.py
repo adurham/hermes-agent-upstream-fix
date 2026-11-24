@@ -117,10 +117,18 @@ DEFAULT_CONFIG = {
         "cron_drain_timeout": 30,
         # In-band restart (/restart, SIGUSR1, `hermes update`) is "restart when idle": the gateway
         # keeps serving (new turns, notices, delegation completions) and restarts at the first moment
-        # no work is in flight. Live work is never interrupted on a timer: each time this many seconds
-        # pass with work still running, a WARNING names every unit and the wait continues. Only a
-        # forced restart (`pause-for-update` with force) or SIGTERM stops live work.
+        # no work is in flight. Each time this many seconds pass with work still running, a WARNING
+        # names every unit and the wait continues — this is the warning interval, not a cap.
         "restart_after_turn_timeout": 1800,
+        # Hard bound on that wait. A restart the owner asked for (desktop Restart, `hermes gateway
+        # restart`, SIGUSR1) must converge even when a holder never goes idle: when this many seconds
+        # pass with live work still running, it logs a WARNING naming every unit, delivers one line
+        # to the home channel, stops that work and restarts. Ordinary turns still finish undisturbed
+        # before this bound. 0 = never force (the pre-bound behaviour: wait forever).
+        "restart_wait_timeout": 120,
+        # The same bound for an UPDATE pause (`pause-for-update` / `hermes update`), which must not be
+        # forced mid-write: it is deliberately much longer than restart_wait_timeout. 0 = never force.
+        "update_restart_wait_timeout": 1800,
         # Max seconds a submitted prompt waits for the deferred agent build (MCP discovery, model
         # metadata, skills scan) before failing visibly. The prompt is delivered as soon as the
         # build completes (progress notice past 30s), so this only fires on a hung build. Raise for

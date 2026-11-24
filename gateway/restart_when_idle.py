@@ -7,24 +7,45 @@ background-delegation completion was refused ``runtime_draining`` for up to
 (turns, delegations, tool subprocesses). Parents could not hear back from their children for the
 whole wait, then lost them.
 
-Now the restart is "restart when idle": nothing is refused while work is in flight, the restart
-happens at the first moment no work is (background delegations, notify-watched background
-processes and queued completion notices count, since each delivers a new turn later), and the cap
-only means "warn and name what is still running". Only an explicit force (``pause-for-update`` with
-``{"force": true}``) stops live work; SIGTERM keeps its immediate-stop meaning.
+Now the restart is "restart when idle": nothing is refused while work is in flight, and the restart
+happens at the first moment no work is (background delegations, notify-watched background processes
+and queued completion notices count, since each delivers a new turn later).
+
+The wait is BOUNDED (``agent.restart_wait_timeout``, default 120s). A restart the owner asked for
+must converge even when a holder never goes idle — a no_agent cron script run inside the gateway
+cgroup holds ``_awaitable_work_count`` by design, and nothing used to end that wait at all. At the
+bound the wait logs a WARNING naming every unit, delivers one line to the owner's home channels,
+stops that work through the existing ``force_restart()`` escalation, and arms an external reaper
+that restarts the unit from outside the process if its own stop never lands. Before the bound, live
+work is never interrupted: ``agent.restart_after_turn_timeout`` only means "warn and name what is
+still running". An update pause keeps its own, much longer bound
+(``agent.update_restart_wait_timeout``) so an update is never forced mid-write, and SIGTERM keeps
+its immediate-stop meaning.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import shlex
+import shutil
+import subprocess
 import time
+from typing import Any
 
 logger = logging.getLogger("gateway.run")
 
 # How often the wait re-checks for idleness and refreshes the published ``active_work``.
 _POLL_S = 0.1
 _STATUS_EVERY_S = 30.0
+# Grace between the in-process forced stop and the external reaper's ``systemctl restart``. A stop
+# that is making progress still spends tens of seconds here: it kills tool subprocesses, gives
+# interrupted agents 5s to unwind and signals every managed worker. The shutdown watchdog already
+# os._exit()s within ~60s of the stop beginning, so nothing legitimately takes 90s — past it the only
+# explanation left is a stop that cannot land, and the unit must be bounced from outside.
+_EXTERNAL_BACKSTOP_DELAY_S = 90.0
+# How long the bound-expiry notice may hold the restart: the line is best-effort, the restart is not.
+_NOTICE_TIMEOUT_S = 5.0
 
 
 def delegation_units(now: float) -> list[dict]:
@@ -96,12 +117,100 @@ def _idle(runner) -> bool:
     return runner._awaitable_work_count() <= 0 and not background_units(runner)
 
 
+def _wait_bound(runner) -> float:
+    """Seconds this wait may hold before live work is stopped; 0 means unbounded (pre-bound)."""
+    try:
+        return max(float(getattr(runner, "_restart_wait_bound", 0.0) or 0.0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _notify_owner_of_escalation(runner, bound: float, units: str) -> bool:
+    """One line to the owner's usual surface: the bound expired and live work is being stopped.
+
+    Best-effort and time-boxed — a transport that hangs must not delay the restart the bound exists
+    to guarantee. The gateway WARNING is the durable record; this is the part a person sees.
+    """
+    notify: Any = getattr(runner, "_notify_home_channels_restart_forced", None)
+    if not callable(notify):
+        return False
+    message = (
+        f"Gateway restart: live work was still running after {bound:.0f}s, so it is being stopped "
+        f"to restart now. Interrupted: {units}"
+    )
+    try:
+        await asyncio.wait_for(notify(message), timeout=_NOTICE_TIMEOUT_S)
+        return True
+    except Exception:
+        logger.warning("Could not deliver the restart-escalation notice to the owner", exc_info=True)
+        return False
+
+
+def external_restart_argv(pid: int, unit: str, delay_s: float) -> list[str]:
+    """The detached reaper's command: bounce ``unit`` if ``pid`` is still alive after ``delay_s``.
+
+    Same mechanism as ``hermes-gw-bounce.service`` — a ``systemctl restart`` issued by the service
+    manager, not by the process it replaces. ``kill -0`` gates it: once this process has exited the
+    reaper does nothing, so a clean stop can never race a second restart.
+    """
+    script = f"sleep {max(float(delay_s), 0.0):.0f}; kill -0 {int(pid)} 2>/dev/null && exec systemctl --user restart {shlex.quote(unit)}"
+    return ["bash", "-lc", script]
+
+
+def arm_external_restart_backstop(runner) -> bool:
+    """Arm the outside-the-process restart that covers a stop which never lands.
+
+    The in-process forced stop is the primary escalation: it drains, persists state, marks
+    interrupted work and exits 75 for the supervisor. This covers the class where that stop cannot
+    reach its own loop again. The reaper is spawned in this unit's cgroup, so systemd's stop job
+    kills it the moment the gateway really exits — it can only ever fire while this process is
+    still alive and no stop job was issued.
+
+    Supervised restarts only (a detached ``/restart`` already owns its relaunch watcher), and only
+    when this process can name its own unit. False when nothing was armed.
+    """
+    if not getattr(runner, "_restart_via_service", False):
+        return False
+    if getattr(runner, "_restart_backstop_armed", False):
+        return False
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        logger.info("No external restart backstop: XDG_RUNTIME_DIR is unset; systemctl --user cannot reach the manager")
+        return False
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return False
+    from gateway.shutdown_forensics import systemd_unit_name
+    unit = systemd_unit_name()
+    if not unit:
+        logger.info("No external restart backstop: this process is not owned by a systemd unit")
+        return False
+    pid = os.getpid()
+    try:
+        subprocess.Popen(
+            external_restart_argv(pid, unit, _EXTERNAL_BACKSTOP_DELAY_S),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ),
+            start_new_session=True,  # detached-spawn: ok — restarts the unit if this process's own stop wedges
+        )
+    except OSError:
+        logger.warning("Could not arm the external restart backstop", exc_info=True)
+        return False
+    runner._restart_backstop_armed = True
+    logger.warning(
+        "Armed external restart backstop: systemctl --user restart %s if pid %s is still alive in %.0fs",
+        unit, pid, _EXTERNAL_BACKSTOP_DELAY_S,
+    )
+    return True
+
+
 async def await_idle(runner) -> bool:
     """Keep serving until the gateway is idle (True) or a force arrives (False).
 
     ``agent.restart_after_turn_timeout`` is a warning interval: each time it elapses with work
-    still live, a WARNING names every unit and the wait continues. Wedged chat turns (no activity
-    past ``agent.gateway_timeout``) and restart-safe external cron runs never hold it.
+    still live, a WARNING names every unit and the wait continues. ``agent.restart_wait_timeout``
+    is the bound: when it expires the wait stops live work through ``force_restart()`` and returns
+    False, so a user-initiated restart converges even when a holder never goes idle. A bound of 0
+    keeps the old unbounded wait. Wedged chat turns (no activity past ``agent.gateway_timeout``)
+    and restart-safe external cron runs never hold it.
     """
     force = getattr(runner, "_restart_force_event", None)
     if force is None:
@@ -109,18 +218,37 @@ async def await_idle(runner) -> bool:
     if _idle(runner) or force.is_set():
         return not force.is_set()
     warn_every = float(getattr(runner, "_restart_after_turn_timeout", 0.0) or 0.0)
-    logger.info("Restart requested; waiting for idle while serving normally (warn after %.0fs): %s",
-                warn_every, _log_view(runner._describe_active_work()))
+    bound = _wait_bound(runner)
+    logger.info(
+        "Restart requested; waiting for idle while serving normally (warn after %.0fs, force after %s): %s",
+        warn_every, f"{bound:.0f}s" if bound else "never", _log_view(runner._describe_active_work()))
     loop = asyncio.get_running_loop()
     started = loop.time()
+    deadline = started + bound if bound else None
     next_warn = started + warn_every
     last_status = 0.0
     while not _idle(runner):
         now = loop.time()
+        if deadline is not None and now >= deadline:
+            units = _log_view(runner._describe_active_work())
+            logger.warning(
+                "Restart wait bound %.0fs expired with live work still running: stopping it now so "
+                "the restart converges. Interrupting: %s", bound, units)
+            await _notify_owner_of_escalation(runner, bound, units)
+            # Arm the outside-the-process restart BEFORE the in-process stop: if that stop wedges,
+            # this is what still ends in a new gateway process.
+            arm_external_restart_backstop(runner)
+            force_restart(
+                runner,
+                detached=bool(getattr(runner, "_restart_detached", False)),
+                via_service=bool(getattr(runner, "_restart_via_service", True)),
+            )
+            return False
         if now >= next_warn:
             logger.warning(
-                "Restart still waiting after %.0fs; live work is NOT interrupted (only a forced "
-                "restart stops it). Waiting on: %s", now - started, _log_view(runner._describe_active_work()))
+                "Restart still waiting after %.0fs; live work is NOT interrupted (%s). Waiting on: %s",
+                now - started, f"forced restart or the {bound:.0f}s bound stops it" if bound
+                else "only a forced restart stops it", _log_view(runner._describe_active_work()))
             next_warn = now + max(warn_every, _STATUS_EVERY_S)
         if now - last_status >= _STATUS_EVERY_S:
             runner._scale_to_zero_status("draining", "restart wait: status mark failed")
@@ -136,13 +264,21 @@ async def await_idle(runner) -> bool:
 
 
 def request_restart(runner, *, detached: bool, via_service: bool) -> bool:
-    """Schedule the restart-when-idle task (idempotent). Admission stays open until ``stop()``."""
+    """Schedule the restart-when-idle task (idempotent). Admission stays open until ``stop()``.
+
+    The wait is bounded by ``agent.restart_wait_timeout``: serving normally continues until the
+    gateway is idle or the bound expires, whichever comes first. An update pause re-bounds the same
+    wait with ``agent.update_restart_wait_timeout`` instead.
+    """
     if runner._restart_task_started:
         return False
     runner._restart_requested = True
     runner._restart_detached = detached
     runner._restart_via_service = via_service
     runner._restart_task_started = True
+    # Bound THIS wait: a restart the owner asked for has to converge. request_service_restart swaps
+    # in the (longer) update bound when an update adopts or starts the wait.
+    runner._restart_wait_bound = float(getattr(runner, "_restart_wait_timeout", 0.0) or 0.0)
     # Hold dispatch from the moment the restart is requested: the idle wait counts in-flight
     # workers, and a dispatcher that keeps filling freed slots can keep that count above zero
     # forever (observed: a 40-minute wait that never converged). The hold clears when this
@@ -189,10 +325,13 @@ def request_service_restart(runner) -> bool:
     hears ``pausing`` instead of stopping a gateway that is still doing work. False only once the
     stop has begun (``_run_restart`` closes admission in the tick it reads the plan)."""
     if request_restart(runner, detached=False, via_service=True):
+        runner._restart_wait_bound = float(getattr(runner, "_update_restart_wait_timeout", 0.0) or 0.0)
         return True
     if getattr(runner, "_stop_task", None) is not None or getattr(runner, "_draining", False):
         return False
     runner._restart_detached, runner._restart_via_service = False, True
+    # The pause's own (longer) bound replaces the restart's: an update must not be forced mid-write.
+    runner._restart_wait_bound = float(getattr(runner, "_update_restart_wait_timeout", 0.0) or 0.0)
     return True
 
 
@@ -209,4 +348,6 @@ def force_restart(runner, *, detached: bool = False, via_service: bool = True) -
         # A restart is already waiting: the force's relaunch plan replaces the one it captured
         # (an update pause must not launch a /restart's detached helper mid-update).
         runner._restart_detached, runner._restart_via_service = detached, via_service
+    # A force waits for nothing, so no bound applies to this wait.
+    runner._restart_wait_bound = 0.0
     return True

@@ -203,6 +203,21 @@ def context_as_json(ctx: dict[str, Any]) -> str:
         return "{}"
 
 
+def systemd_unit_name() -> Optional[str]:
+    """This process's systemd unit name from ``/proc/self/cgroup``; None when not unit-owned.
+
+    ``0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service`` →
+    ``hermes-gateway.service``. Used to bounce the unit from outside the process (and to check
+    ``TimeoutStopUSec``) without trusting argv or an environment the caller could have replaced.
+    """
+    with contextlib.suppress(OSError), open("/proc/self/cgroup", encoding="utf-8") as fh:
+        for line in fh:
+            unit_name = next((p for p in reversed(line.strip().split("/")) if p.endswith(".service")), None)
+            if unit_name:
+                return unit_name
+    return None
+
+
 def check_systemd_timing_alignment(
     drain_timeout: float, cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
 ) -> Optional[dict[str, Any]]:
@@ -214,14 +229,7 @@ def check_systemd_timing_alignment(
     """
     if not os.environ.get("INVOCATION_ID"):
         return None  # Not running under systemd (or at least not directly)
-    # /proc/self/cgroup: "0::/user.slice/.../hermes-gateway.service"
-    unit_name: Optional[str] = None
-    with contextlib.suppress(OSError), open("/proc/self/cgroup", encoding="utf-8") as fh:
-        for line in fh:
-            parts = reversed(line.strip().split("/"))
-            unit_name = next((p for p in parts if p.endswith(".service")), None)
-            if unit_name:
-                break
+    unit_name = systemd_unit_name()
     if (timeout_us := _systemd_timeout_stop_us(unit_name) if unit_name else None) is None:
         return None
     timeout_stop_sec = timeout_us / 1_000_000.0

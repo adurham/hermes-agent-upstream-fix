@@ -19,8 +19,10 @@ from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
-    DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, parse_cron_drain_timeout,
+    DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT, DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
+    DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT, parse_cron_drain_timeout,
     parse_restart_after_turn_timeout, parse_restart_drain_timeout,
+    parse_restart_wait_timeout, parse_update_restart_wait_timeout,
     launchd_service_label, parse_signal_interrupt_grace_timeout, read_launchd_exit_timeout_s,
     resolve_launchd_capped_drain,
 )
@@ -618,6 +620,22 @@ class GatewayConfigLoadersMixin:
         return cls._load_env_or_agent_cfg_timeout(
             "HERMES_RESTART_AFTER_TURN_TIMEOUT", "restart_after_turn_timeout",
             parse_restart_after_turn_timeout, DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
+        )
+
+    @classmethod
+    def _load_restart_wait_timeout(cls) -> float:
+        """Hard bound on an in-band restart's wait-for-idle in seconds (0 = never force)."""
+        return cls._load_env_or_agent_cfg_timeout(
+            "HERMES_RESTART_WAIT_TIMEOUT", "restart_wait_timeout",
+            parse_restart_wait_timeout, DEFAULT_GATEWAY_RESTART_WAIT_TIMEOUT,
+        )
+
+    @classmethod
+    def _load_update_restart_wait_timeout(cls) -> float:
+        """The update pause's own wait-for-idle bound in seconds (0 = never force)."""
+        return cls._load_env_or_agent_cfg_timeout(
+            "HERMES_UPDATE_RESTART_WAIT_TIMEOUT", "update_restart_wait_timeout",
+            parse_update_restart_wait_timeout, DEFAULT_GATEWAY_UPDATE_RESTART_WAIT_TIMEOUT,
         )
 
     @classmethod
