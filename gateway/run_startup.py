@@ -713,6 +713,7 @@ class GatewayStartupMixin:
         heartbeat writer, which would otherwise make a draining gateway look healthy to probes."""
         for attr, method, what in (
             ("_loop_liveness_watchdog", "stop", "stop gateway loop liveness watchdog"),
+            ("_loop_stall_watchdog", "stop", "stop gateway loop stall reporter"),
             ("_loop_floor_timer_handle", "cancel", "cancel gateway loop floor timer"),
             ("_loop_heartbeat_task", "cancel", "cancel gateway loop heartbeat task"),
         ):
