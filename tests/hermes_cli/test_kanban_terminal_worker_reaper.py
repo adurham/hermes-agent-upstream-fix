@@ -7,6 +7,12 @@ sweeps never look at a ``done`` card again, so a worker that called
 was invisible to every command. The closed ``task_runs`` row now keeps the pid
 and its spawn fingerprint, and ``reap_terminal_workers`` ends such a worker on
 the next tick — never a recycled PID, never a legacy row without a fingerprint.
+
+The reap RECORDS itself in ``worker_reaped_at`` and keeps the pid: that column is
+the bound interpreter's life tie (``gateway.session_kanban._watch_submitter``
+exits when the retained pid dies, and reads NULL as "no pid recorded yet"), so
+wiping it made the reap blind rather than final — the run row below is asserted
+to keep its evidence precisely so this cannot be "tidied" back.
 """
 
 from __future__ import annotations
@@ -69,10 +75,19 @@ def test_worker_alive_after_completion_is_reaped_on_dispatch_tick(conn):
 
         assert result.reaped_terminal_workers == [tid]
         assert proc.wait(timeout=10) is not None
-        run = conn.execute("SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?", (run_id,)).fetchone()
-        assert run["worker_pid"] is None and run["worker_started_at"] is None
+        run = conn.execute(
+            "SELECT worker_pid, worker_started_at, worker_reaped_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        # The evidence STAYS: the bound interpreter's watcher exits on a dead pid, and a NULL
+        # column is the "no pid recorded yet" state it deliberately holds through.
+        assert run["worker_pid"] == proc.pid and run["worker_started_at"] is not None
+        assert run["worker_reaped_at"] is not None
         kinds = [r["kind"] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
         assert "terminal_worker_reaped" in kinds
+        # The reaped marker, not a NULL pid, is the idempotency key: the next tick is a no-op.
+        assert kbd.reap_terminal_workers(conn) == []
+        kinds = [r["kind"] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert kinds.count("terminal_worker_reaped") == 1
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -92,9 +107,16 @@ def test_recycled_pid_and_legacy_row_are_never_signalled(conn):
         assert kbd.reap_terminal_workers(conn) == []
 
         assert stranger.poll() is None and legacy.poll() is None
-        # Stale evidence is dropped so the row is not rescanned; the legacy row is left alone.
-        assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()["worker_pid"] is None
+        # The recycled row is closed out (never rescanned) but keeps its pid; the legacy row,
+        # which has no fingerprint to prove identity, is left untouched.
+        recycled = conn.execute(
+            "SELECT worker_pid, worker_reaped_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert recycled["worker_pid"] == stranger.pid and recycled["worker_reaped_at"] is not None
         assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (legacy_run,)).fetchone()["worker_pid"] == legacy.pid
+        assert conn.execute(
+            "SELECT worker_reaped_at FROM task_runs WHERE id=?", (legacy_run,)
+        ).fetchone()["worker_reaped_at"] is None
     finally:
         for p in (stranger, legacy):
             p.kill()

@@ -904,6 +904,9 @@ _TASK_RUN_COLUMNS = (
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Marker set by the terminal-worker reaper once it has ended (or found gone) the run's worker;
+    # the pid itself is retained so a bound interpreter can still see it die. NULL = not yet reaped.
+    ("worker_reaped_at", "worker_reaped_at INTEGER"),
 )
 
 
@@ -1081,7 +1084,7 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_started_at INTEGER, worker_reaped_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",

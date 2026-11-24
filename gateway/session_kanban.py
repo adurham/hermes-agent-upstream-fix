@@ -210,7 +210,13 @@ def _watch_submitter(db, run_id):
     """The dispatcher's spawned worker is this attempt's handle: killing it (an operator, a
     timeout, an OOM kill) must end the attempt, as it did when the worker ran the agent itself.
     Exiting hard leaves no ``worker_result``, so the dead-worker sweep books this run's crash.
-    The run row is re-read each tick: the dispatcher records the pid only after its spawn returns."""
+    The run row is re-read each tick: the dispatcher records the pid only after its spawn returns.
+
+    A run that has ENDED keeps its ``worker_pid`` (``reap_terminal_workers`` records the reap in
+    ``worker_reaped_at`` and never clears the pid), so this tie still fires for an interpreter that
+    outlived its run: the reaper SIGTERMs that pid, this loop reads it as dead, and the attempt
+    ends. NULL means only "no pid recorded yet" — never treat it as dead, and never clear the
+    column to signal a reap: a blind watcher cannot end anything."""
     import os
     from hermes_cli.kanban_db_dispatch import _worker_alive
 

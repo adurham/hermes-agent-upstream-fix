@@ -1052,6 +1052,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- worker_pid after the run ends so a worker that outlives its terminal transition can
     -- still be found and reaped; NULL = legacy row, never signalled.
     worker_started_at   INTEGER,
+    -- When ``reap_terminal_workers`` finished with this run's worker (ended it, or found the pid
+    -- gone). The pid + fingerprint above are RETAINED, never cleared: ``gateway.session_kanban``
+    -- ``_watch_submitter`` reads ``worker_pid`` and exits its bound interpreter when that worker is
+    -- dead, while NULL reads as "the dispatcher has not recorded a pid yet" (blind, not dead). This
+    -- column is the reaper's idempotency key, not a liveness signal. NULL = not yet reaped.
+    worker_reaped_at    INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,

@@ -605,15 +605,23 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
     fds open and no ``running``-only sweep can see it once ``tasks.worker_pid`` is
     cleared. Keys on the closed ``task_runs`` row's retained pid + spawn
     fingerprint: a legacy row (NULL fingerprint) or a recycled PID is never
-    signalled; a pid that is simply gone just has its evidence cleared. A run
+    signalled; a pid that is simply gone is marked reaped without a signal. A run
     that ended less than ``TERMINAL_WORKER_REAP_GRACE_SECONDS`` ago is left
     alone so a worker still finalising after its own transition is not killed.
     One row's failure (signal, /proc probe) is logged and skips only that row.
-    Returns the task ids whose worker was terminated."""
+    Returns the task ids whose worker was terminated.
+
+    The retained pid is NEVER cleared: it is the one handle a bound interpreter
+    can still observe dying (``gateway.session_kanban._watch_submitter`` exits on
+    a dead ``worker_pid`` and reads NULL as "not recorded yet"), so a reap that
+    wiped it disarmed the lifecycle tie instead of ending the attempt. The
+    ``worker_reaped_at`` marker, not a NULL pid, is what makes this sweep
+    idempotent — a reaped row keeps its evidence and is not scanned again."""
     rows = conn.execute(
         "SELECT id, task_id, worker_pid, worker_started_at, claim_lock FROM task_runs "
         "WHERE ended_at IS NOT NULL AND ended_at <= ? "
-        "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL",
+        "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL "
+        "AND worker_reaped_at IS NULL",
         (int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS,),
     ).fetchall()
     host_prefix = _kb._host_prefix()
@@ -630,11 +638,19 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
 
 
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
+    """Close out one terminal run's retained worker handle.
+
+    Marks the row reaped; it does NOT clear ``worker_pid`` / ``worker_started_at``.
+    Those columns are the bound interpreter's life tie (see
+    :func:`reap_terminal_workers`), so clearing them here would leave a survivor
+    with nothing to notice — the defect that let an interpreter publish 772 s
+    after its run was recorded done (#111791 follow-up).
+    """
     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
     if pid == os.getpid() or not str(row["claim_lock"] or "").startswith(host_prefix):
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
-        return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
+        return  # unproven identity: never signalled; the row is marked reaped once the pid is gone
     alive = _worker_alive(pid, fingerprint)
     termination = None
     if alive:
@@ -644,9 +660,9 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             return  # still alive: try again next tick
     with _kb.write_txn(conn):
         conn.execute(
-            "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
-            (row["id"], pid, fingerprint),
+            "UPDATE task_runs SET worker_reaped_at = ? "
+            "WHERE id = ? AND worker_pid = ? AND worker_started_at = ? AND worker_reaped_at IS NULL",
+            (int(time.time()), row["id"], pid, fingerprint),
         )
         if alive:
             _kb._append_event(

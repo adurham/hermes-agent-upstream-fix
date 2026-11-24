@@ -1554,6 +1554,21 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
 
 
 
+def test_rebuilt_task_runs_spec_matches_the_fresh_schema():
+    """The drifted-table rebuild recreates ``task_runs`` from ``_REBUILD_SPECS`` and copies only
+    the columns that spec declares, so a column added to ``SCHEMA_SQL`` but not to the spec is
+    silently DROPPED on every rebuild. That is not cosmetic here: ``worker_reaped_at`` is the
+    terminal reaper's idempotency key, so losing it makes every already-reaped row due again.
+    """
+    fresh = sqlite3.connect(":memory:")
+    fresh.executescript(kb.SCHEMA_SQL)
+    fresh_cols = [r[1] for r in fresh.execute("PRAGMA table_info(task_runs)")]
+    rebuilt = sqlite3.connect(":memory:")
+    rebuilt.execute(kbc._REBUILD_SPECS["task_runs"][0])
+    rebuilt_cols = [r[1] for r in rebuilt.execute("PRAGMA table_info(task_runs)")]
+    assert sorted(rebuilt_cols) == sorted(fresh_cols)
+
+
 def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_home):
     """A board whose ``tasks`` table was created by an external harness without
     the nullable/defaulted v1 columns (body, assignee, priority, ..., claim_lock,
