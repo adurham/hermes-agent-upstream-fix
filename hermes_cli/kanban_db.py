@@ -420,10 +420,116 @@ def current_board_path() -> Path:
     return kanban_home() / "kanban" / "current"
 
 
+def lane_board_pin(profile: Optional[str] = None) -> Optional[str]:
+    """``kanban.board`` — the board a *profile's* lane is pinned to, or ``None``.
+
+    Without a pin, the only thing between a session/cron mint and somebody else's board is the
+    global ``<root>/kanban/current`` pointer, which belongs to whichever lane last ran
+    ``boards switch``. Measured 2026-11-24: `current` held ``hub``, so two ps5-pm successor cards
+    minted with no explicit board landed on hub and died on the owner's
+    "Kanban execution unknown; retained by owner" — the lane cannot execute on another lane's board.
+
+    *profile=None* reads the **active** profile's merged config (the normal in-process case). A
+    named profile is read straight off ``<profile>/config.yaml``: this is also consulted for the
+    *assignee* from a creator running in a different profile's ``HERMES_HOME``, where the config
+    cache would otherwise answer for the wrong lane.
+    """
+    name = (profile or "").strip()
+    if not name:
+        try:
+            from hermes_cli.config import load_config_readonly
+            section = load_config_readonly().get("kanban") or {}
+            return _normalize_board_slug(section.get("board"))
+        except Exception:
+            return None
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        if not profile_exists(name):
+            return None
+        path = Path(get_profile_dir(name)) / "config.yaml"
+        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+            return None
+        import yaml
+        section = (yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}).get("kanban") or {}
+        return _normalize_board_slug(section.get("board"))
+    except Exception:
+        return None
+
+
+def lane_cross_boards(profile: Optional[str] = None) -> frozenset:
+    """``kanban.cross_board`` — boards a pinned profile may still file its own cards on.
+
+    A pin alone would forbid the cross-lane filing the ps5 lane actually does (535 of its cards
+    are on ``ps5-hv``), so any other board it targets must be named here. Empty set when unset.
+    """
+    name = (profile or "").strip()
+    try:
+        if not name:
+            from hermes_cli.config import load_config_readonly
+            raw = (load_config_readonly().get("kanban") or {}).get("cross_board")
+        else:
+            from hermes_cli.profiles import get_profile_dir, profile_exists
+            if not profile_exists(name):
+                return frozenset()
+            path = Path(get_profile_dir(name)) / "config.yaml"
+            if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+                return frozenset()
+            import yaml
+            raw = (yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}).get("kanban", {}).get("cross_board")
+        if isinstance(raw, str):
+            raw = [part.strip() for part in raw.split(",")]
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            return frozenset()
+        out = set()
+        for item in raw:
+            normed = _normalize_board_slug(str(item))
+            if normed:
+                out.add(normed)
+        return frozenset(out)
+    except Exception:
+        return frozenset()
+
+
+def lane_board_violation(*, assignee: Optional[str], board: Optional[str],
+                         created_by: Optional[str] = None) -> Optional[str]:
+    """One-line refusal when a card for a pinned lane is being filed on a board it cannot run on.
+
+    ``board=None`` means "resolve as usual", so the check judges the board the create would
+    actually land on — which is how a stale session board snapshot (``HERMES_KANBAN_BOARD`` pinned
+    to another lane at boot) gets caught instead of silently minting a dead card. Returns ``None``
+    (allow) for every profile without a pin, so no other lane's routing changes.
+    """
+    who = (assignee or "").strip()
+    if not who:
+        return None
+    pin = lane_board_pin(who)
+    if not pin:
+        return None
+    try:
+        target = _normalize_board_slug(board) or get_current_board()
+    except Exception:
+        return None
+    if target == pin or target in lane_cross_boards(who):
+        return None
+    return (
+        f"refused: the {who} lane is pinned to board '{pin}' (kanban.board) and '{target}' is not in "
+        f"its kanban.cross_board list. A {who} card filed on '{target}' cannot be executed: that "
+        f"board's owner answers 'Kanban execution unknown; retained by owner' and the worker exits 1, "
+        f"which is how two successors died on 2026-11-24. File on '{pin}', or add '{target}' to "
+        f"kanban.cross_board in the {who} profile config to allow it deliberately."
+    )
+
+
 def get_current_board() -> str:
-    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
-    (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
+    """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> this profile's ``kanban.board``
+    lane pin -> ``<root>/kanban/current`` (only while that board exists) -> ``DEFAULT_BOARD``. A
+    malformed/stale slug falls through — the dispatcher must never crash on a hand-edited file.
+
+    The lane pin sits below the env pin on purpose: a dispatcher-spawned worker carries its own
+    card's board in ``HERMES_KANBAN_BOARD`` and must keep resolving that (a ps5-pm worker on a
+    ``ps5-hv`` card is normal), while a plain session with no card falls through to its lane
+    instead of to whatever board some other profile switched the global pointer to.
+    """
     def _existing(candidate: str) -> Optional[str]:
         if not candidate:
             return None
@@ -447,6 +553,11 @@ def get_current_board() -> str:
         found = _existing(candidate)
         if found:
             return found
+    # This profile's own lane board, above the shared pointer: a successor minted from a session
+    # that snapshotted another lane's `current` must still land where its owner can dispatch it.
+    found = _existing(lane_board_pin() or "")
+    if found:
+        return found
     try:
         f = current_board_path()
         if f.exists():
@@ -1193,6 +1304,13 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # A card for a pinned lane on a board that lane cannot execute on is dead on arrival: refuse
+    # it here, where the create is cheap, instead of letting the dispatcher burn two attempts and
+    # a retry on the owner's "Kanban execution unknown; retained by owner" (2026-11-24: two
+    # ps5-pm successors died this way in 30 minutes).
+    _lane_refusal = lane_board_violation(assignee=assignee, board=board, created_by=created_by)
+    if _lane_refusal:
+        raise ValueError(_lane_refusal)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo

@@ -2016,6 +2016,15 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Board this profile's lane is pinned to ("" = no pin: resolve HERMES_KANBAN_BOARD, then
+        # the shared <root>/kanban/current pointer). A pin is what stops a successor minted from a
+        # session or cron run from landing on whichever board another lane last switched `current`
+        # to — such a card is undispatchable ("Kanban execution unknown; retained by owner").
+        "board": "",
+        # Boards this profile may still file its own cards on while pinned (its cross-lane surface,
+        # e.g. a lane that files hypervisor cards on `ps5-hv`). Any board not listed is refused at
+        # create time with a one-line reason instead of dying after two dispatch attempts.
+        "cross_board": [],
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

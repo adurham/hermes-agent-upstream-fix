@@ -194,9 +194,33 @@ Board resolution order (highest precedence first):
 1. Explicit `--board <slug>` on the CLI call.
 2. `HERMES_KANBAN_BOARD` env var (set by the dispatcher when spawning a
    worker, so workers can't see other boards).
-3. `~/.hermes/kanban/current` — the slug persisted by `hermes kanban
+3. `kanban.board` — the board *this profile's lane* is pinned to, if set.
+4. `~/.hermes/kanban/current` — the slug persisted by `hermes kanban
    boards switch`.
-4. `default`.
+5. `default`.
+
+`~/.hermes/kanban/current` is shared state: it belongs to whichever lane
+last ran `boards switch`. A profile that mints successors or files
+follow-ups from a session or cron run therefore needs its own pin, or its
+cards land on the board that pointer happens to name — where that board's
+owner may refuse to execute them (`Kanban execution unknown; retained by
+owner`) and the worker exits 1. Pin the lane in the profile's
+`config.yaml`:
+
+```yaml
+kanban:
+  # The board this profile's cards belong on.
+  board: default
+  # Other boards this lane may still file its own cards on. Anything else
+  # is refused at create time with a one-line reason instead of filing a
+  # card that cannot be dispatched.
+  cross_board: [ps5-hv]
+```
+
+A pin only changes resolution for the profile that sets it, sits *below*
+the env pin (a worker still resolves its own card's board), and a card for
+the pinned lane on a board outside `kanban.cross_board` is rejected by
+`kanban_create` before any row is written.
 
 Slugs are validated: lowercase alphanumerics + hyphens + underscores, 1-64
 chars, must start with alphanumeric. Uppercase input is auto-downcased.
