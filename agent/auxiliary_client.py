@@ -7458,13 +7458,16 @@ def _timeout_seconds(timeout: Any, default: Optional[float] = None) -> Optional[
     Internal guards do arithmetic on this number — ``_aux_stream_total_ceiling``,
     ``_anthropic_no_progress_timeout``, the Codex stream guard, the "timed out after Ns" log — and must
     never receive the wire object. ``httpx.Timeout.read`` IS that budget; the connect cap is
-    deliberately invisible here.
+    deliberately invisible here. A plain number is returned as given, so a caller's ``timeout=30``
+    still logs as ``30`` and not ``30.0``.
     """
     if timeout is None:
         return default
     read = getattr(timeout, "read", None)
     if isinstance(read, (int, float)) and not isinstance(read, bool):
-        return float(read)
+        return read
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+        return timeout
     try:
         return float(timeout)
     except (TypeError, ValueError):
@@ -8664,9 +8667,13 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
                            "the generation budget) on %s, trying fallback", task or "call", tag,
                            route.base_info or resolved_provider, _AUX_CONNECT_TIMEOUT_SECONDS, resolved_provider)
         else:
+            # ``route.timeout`` is the numeric budget; ``:g`` keeps a whole number whole (``30s``,
+            # not ``30.0s``) so the message still names the knob the user configured.
+            budget = route.timeout
+            budget_text = f"{budget:g}" if isinstance(budget, (int, float)) else f"{budget}"
             logger.warning("Auxiliary %s%s: request to %s %s (raise auxiliary.%s.%s for slow or reasoning "
                            "models) on %s, trying fallback", task or "call", tag, route.base_info or resolved_provider,
-                           first_err if stalled else f"timed out after {route.timeout}s", task or "call",
+                           first_err if stalled else f"timed out after {budget_text}s", task or "call",
                            "no_progress_timeout" if stalled else "timeout", resolved_provider)
     else:
         logger.info("Auxiliary %s%s: %s on %s (%s), trying fallback",
