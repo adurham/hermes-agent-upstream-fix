@@ -234,6 +234,10 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    capacity_resumed: list[str] = field(default_factory=list)
+    """Task ids returned to ``ready`` from a ``parked_capacity`` deferral because
+    their lane drained below the ceiling recorded at park time. NOT a failure
+    and NOT an operator action — the automatic undo of a capacity park."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -2734,6 +2738,17 @@ def _dispatch_once_locked(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
+    # A capacity park is undone here, every tick: as soon as a lane drains below
+    # the ceiling recorded at park time its oldest parked card returns to
+    # ``ready`` — no operator, no unblock, no orchestration turn. Runs before the
+    # spawn budget so a just-resumed card is claimable in the same tick.
+    if not dry_run:
+        resume_capacity = getattr(_kb, "resume_capacity_parks", None)
+        if resume_capacity is not None:   # absent only in a stale, pre-deploy dispatcher
+            try:
+                result.capacity_resumed = resume_capacity(conn)
+            except Exception as exc:      # a capacity resume must never cost the tick
+                _kb._log.warning("kanban dispatcher: capacity resume failed: %s", exc)
     # Recovery before spawning: a card that gave up on a HOST fault (no D-Bus scope, silent board
     # owner) goes back to its runnable phase as soon as the host probes healthy, so the ladder
     # resumes without a human noticing it stopped (measured 2026-11-11: ~6 h dead lane).

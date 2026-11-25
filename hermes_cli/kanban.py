@@ -982,9 +982,12 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    ceiling = getattr(args, "ceiling", None)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    if kind in kb.CAPACITY_BLOCK_KINDS and not ceiling:
+        return _err("--kind parked_capacity needs --ceiling N (the lane's ready-queue bound)")
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -999,11 +1002,51 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
+            if kind in kb.CAPACITY_BLOCK_KINDS:
+                return (f"Parked {tid} (capacity: resumes below ready={ceiling}; "
+                        f"not a failure, no triage){suffix}")
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+        prefix = "PARKED" if kind in kb.CAPACITY_BLOCK_KINDS else "BLOCKED"
+        op = _commented(conn, reason, author, prefix, lambda tid: kb.block_task(
+            conn, tid, reason=reason, kind=kind, ceiling=ceiling,
+            expected_run_id=_worker_run_id_for(tid)))
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+
+
+def _cmd_resume_capacity(args: argparse.Namespace) -> int:
+    assignee = _stripped_or_none(getattr(args, "assignee", None))
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kbc.connect_closing() as conn:
+        if dry_run:
+            rows = conn.execute(
+                "SELECT id, assignee, park_ceiling FROM tasks "
+                "WHERE status = 'blocked' AND block_kind = 'parked_capacity' "
+                + ("AND assignee = ? " if assignee else "")
+                + "ORDER BY created_at ASC, rowid ASC",
+                ((assignee,) if assignee else ()),
+            ).fetchall()
+            ready = {r[0]: int(r[1]) for r in conn.execute(
+                "SELECT assignee, COUNT(*) FROM tasks WHERE status='ready' GROUP BY assignee")}
+            would = []
+            for row in rows:
+                ceiling = row["park_ceiling"]
+                if ceiling is None or ready.get(row["assignee"], 0) >= int(ceiling):
+                    continue
+                ready[row["assignee"]] = ready.get(row["assignee"], 0) + 1
+                would.append(row["id"])
+            resumed = would
+        else:
+            resumed = kb.resume_capacity_parks(conn, assignee=assignee)
+    if getattr(args, "json", False):
+        print(json.dumps({"resumed": resumed, "dry_run": dry_run}, indent=1))
+        return 0
+    verb = "would resume" if dry_run else "resumed"
+    if not resumed:
+        print("capacity: nothing parked below its ceiling — nothing to resume")
+        return 0
+    print(f"capacity: {verb} {len(resumed)} card(s): {', '.join(resumed)}")
+    return 0
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1348,6 +1391,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "resume-capacity": _cmd_resume_capacity,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,

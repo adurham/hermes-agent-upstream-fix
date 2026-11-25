@@ -54,6 +54,17 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for a bound that must be >= 1 (a lane capacity ceiling)."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("ceiling must be >= 1")
+    return parsed
+
+
 def _run_state_args(type_help: str):
     return (
         _arg("--state-type", choices=("status", "outcome"), help=f"With --state-name: {type_help}"),
@@ -321,8 +332,19 @@ _SPECS = [
                   "parents finish, no human); 'needs_input'/'capability' go to "
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
-                  "triage to break unblock loops. Omit for a generic block."),
+                  "triage to break unblock loops. 'parked_capacity' is a capacity "
+                  "deferral, NOT a failure: it never counts a recurrence, never "
+                  "routes to triage, and returns to ready on its own as soon as "
+                  "the lane drains below --ceiling. Omit for a generic block."),
+        _arg("--ceiling", type=_positive_int,
+             help="Ready-queue ceiling that caused a 'parked_capacity' park "
+                  "(required with that kind; the card resumes below it)."),
     ], help="Mark one or more tasks blocked"),
+    _cmd("resume-capacity", [
+        _arg("--assignee", help="Only resume this lane (default: every lane)"),
+        _arg("--dry-run", action="store_true", help="Report what would resume; change nothing"),
+        _json_flag(),
+    ], help="Return 'parked_capacity' cards to ready where the lane has drained below the park ceiling"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),

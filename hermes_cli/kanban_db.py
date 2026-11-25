@@ -108,7 +108,19 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# ``parked_capacity`` is a DISPATCHER capacity deferral, not a failure: it never
+# increments ``block_recurrences`` (so the loop breaker can never route it to
+# ``triage``), it carries the lane ceiling that caused it in ``park_ceiling``,
+# and ``resume_capacity_parks`` returns it to ``ready`` on its own as soon as
+# the lane drains below that ceiling. A guard that parks work must use this kind
+# instead of ``transient``/``needs_input``, which read as a card-level failure.
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "transient", "parked_capacity",
+}
+
+#: Block kinds that are capacity accounting, not failure. They never count a
+#: recurrence and never route to ``triage``.
+CAPACITY_BLOCK_KINDS = frozenset({"parked_capacity"})
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -236,7 +248,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "capacity_resumed",
 )
 
 
@@ -768,6 +780,10 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    # Lane ceiling that caused a ``parked_capacity`` park (NULL for every other
+    # kind): the ready-queue size the lane must drain below before
+    # ``resume_capacity_parks`` returns this card to ``ready``.
+    park_ceiling: Optional[int] = None
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -787,6 +803,9 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            park_ceiling=(
+                int(g("park_ceiling")) if str(g("park_ceiling") or "").strip() else None
+            ),
         )
 
 
@@ -1003,9 +1022,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- same truly-blocked reason after having been unblocked. When it reaches
     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
+    -- successful completion -- NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Ready-queue ceiling of the lane that caused a ``parked_capacity`` park.
+    -- NULL for every other block kind. ``resume_capacity_parks`` promotes the
+    -- card back to ``ready`` as soon as the lane drains below this number.
+    park_ceiling         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2133,10 +2156,13 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'parked_capacity', 'capacity_resumed') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    if row and row["kind"] == "blocked":
+    # ``parked_capacity`` is sticky for a different reason than a human block:
+    # its waiter is the dispatcher's capacity resume, not ``recompute_ready``.
+    # Promoting it here would ignore the lane ceiling entirely.
+    if row and row["kind"] in ("blocked", "parked_capacity"):
         return True
     trip = conn.execute(
         "SELECT payload FROM task_events "
@@ -3273,13 +3299,21 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    ceiling: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
     promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    toward the loop breaker so a forever-flaky task escalates.
+
+    ``kind='parked_capacity'`` is the one NON-FAILURE block: a dispatcher-level
+    capacity deferral (the lane's ready queue is at its ceiling). It requires a
+    positive *ceiling* — the lane bound that caused the park, stored in
+    ``park_ceiling`` — and it never touches ``block_recurrences``, so the
+    escalation counter and the ``triage`` routing cannot see it. It is undone by
+    :func:`resume_capacity_parks` (a dispatcher tick, or the guard's own run),
+    never by a human ``unblock``.
 
     An already-``blocked`` card that the failure breaker parked UNTYPED
     (``block_kind IS NULL``, no live run) is classified in place when *kind*
@@ -3290,6 +3324,13 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if kind in CAPACITY_BLOCK_KINDS:
+        if not isinstance(ceiling, int) or isinstance(ceiling, bool) or ceiling < 1:
+            raise ValueError(
+                "kind='parked_capacity' needs a positive ceiling (the lane's ready-queue bound)"
+            )
+    else:
+        ceiling = None
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3306,17 +3347,24 @@ def block_task(
         if cur_row["status"] == "blocked":
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
+            # A capacity deferral is not a failure: classify without charging a
+            # recurrence, so even an in-place park stays out of the loop breaker.
+            recurrences = 0 if kind in CAPACITY_BLOCK_KINDS else 1
             classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "UPDATE tasks SET block_kind = ?, block_recurrences = ?, "
+                "park_ceiling = ? "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
                 "AND current_run_id IS NULL",
-                (kind, task_id),
+                (kind, recurrences, ceiling, task_id),
             ).rowcount
             if classified != 1:
                 return False
-            _append_event(conn, task_id, "blocked", {
+            payload = {
                 "kind": kind, "reason": reason, "classified_in_place": True,
-            })
+            }
+            if kind in CAPACITY_BLOCK_KINDS:
+                payload["ceiling"] = ceiling
+            _append_event(conn, task_id, "blocked", payload)
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
@@ -3331,6 +3379,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            ceiling=ceiling,
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3356,13 +3405,23 @@ def block_task(
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+    # A capacity deferral is not a card-level failure, so the block-oriented
+    # observers (which page on "this card blocked") must not see it: it fires
+    # its own hook, carrying the ceiling, and is reported once in the digest.
+    if kind in CAPACITY_BLOCK_KINDS:
+        _fire_task_hook(
+            "kanban_task_parked_capacity", blocked_task, task_id, run_id,
+            reason=reason, ceiling=ceiling,
+        )
+    else:
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
+    ceiling: Optional[int] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3380,6 +3439,15 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+    if kind in CAPACITY_BLOCK_KINDS:
+        # Capacity deferral: not a failure. block_recurrences is untouched, so
+        # the unblock-loop breaker (and thus ``triage``) can never see it.
+        payload["ceiling"] = ceiling
+        return (
+            "blocked", "parked_capacity",
+            "block_kind    = ?,\n                       park_ceiling = ?",
+            (kind, ceiling), payload,
+        )
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
@@ -3744,6 +3812,74 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             ),
         )
         return True
+
+
+def resume_capacity_parks(
+    conn: sqlite3.Connection, *, assignee: Optional[str] = None,
+) -> list[str]:
+    """Return ``parked_capacity`` cards to ``ready`` while their lane has room.
+
+    A capacity park is not a failure and nobody has to undo it: this is the
+    automatic undo. It walks every ``parked_capacity`` card in CREATION order
+    (oldest first) and promotes it the moment its assignee's ready queue is
+    below the ceiling recorded at park time (``park_ceiling``). One pass
+    restores up to the ceiling and no further, so the bound holds exactly as
+    the guard set it. Callers: the dispatcher tick (once), and the guard's own
+    run (so a lane drains even before the dispatcher next ticks).
+
+    Each promotion appends a ``capacity_resumed`` event — deliberately not
+    ``unblocked`` — so no block-oriented counter, report or digest sees a
+    resume as a human unblock. Returns the ids promoted, oldest first.
+    Read-only when nothing is parked.
+    """
+    now = int(time.time())
+    resumed: list[str] = []
+    with write_txn(conn):
+        sql = (
+            "SELECT id, assignee, park_ceiling FROM tasks "
+            "WHERE status = 'blocked' AND block_kind = 'parked_capacity' "
+        )
+        params: tuple[Any, ...] = ()
+        if assignee is not None:
+            sql += "AND assignee = ? "
+            params = (assignee,)
+        rows = conn.execute(sql + "ORDER BY created_at ASC, rowid ASC", params).fetchall()
+        if not rows:
+            return []
+        ready: dict[Any, int] = {
+            r["assignee"]: int(r["n"])
+            for r in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks WHERE status = 'ready' GROUP BY assignee"
+            )
+        }
+        for row in rows:
+            lane = row["assignee"]
+            ceiling = row["park_ceiling"]
+            if ceiling is None:
+                # A park with no recorded ceiling cannot know where "below the
+                # cap" is; leave it for an explicit unblock rather than guess.
+                continue
+            before = int(ready.get(lane, 0))
+            if before >= int(ceiling):
+                continue
+            if not _parents_satisfied(conn, row["id"]):
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = NULL, park_ceiling = NULL "
+                "WHERE id = ? AND status = 'blocked' AND block_kind = 'parked_capacity'",
+                (row["id"],),
+            )
+            if cur.rowcount != 1:
+                continue
+            ready[lane] = before + 1
+            _append_event(
+                conn, row["id"], "capacity_resumed",
+                {"ceiling": int(ceiling), "ready_before": before, "resumed_at": now},
+            )
+            resumed.append(row["id"])
+    return resumed
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
