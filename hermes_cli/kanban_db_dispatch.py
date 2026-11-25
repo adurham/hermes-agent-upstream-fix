@@ -156,13 +156,20 @@ def _infrastructure_failure(text: Optional[str], *, host_broken: Optional[bool] 
     return False
 
 
-def _strike_free_exhausted(conn: sqlite3.Connection, task_id: str, limit: int = INFRA_STRIKE_FREE_LIMIT) -> bool:
+def _strike_free_exhausted(conn: sqlite3.Connection, task_id: str, limit: int = INFRA_STRIKE_FREE_LIMIT,
+                           *, pending_infrastructure: bool = False) -> bool:
     """True when *task_id* already took *limit* strike-free retries back to back.
 
     The current attempt's ``crashed`` event is already written when its failure is accounted, so
     the window is ``limit + 1``: *limit* free retries, then the next one is charged like the
     card's own. Without this a card whose worker wedges at startup (a host-flavoured failure
     text, but its own bug) reclaims on every tick and never trips the breaker — a spawn-budget sink.
+
+    ``pending_infrastructure``: the current event is *shaped* like a strike-free one but its
+    verdict is only being decided now (the silent-burst branch, which stamps the event AFTER the
+    count). Read the window as if it carried the flag, without writing it: the previous ``limit``
+    events must all be strike-free. The text-matched paths already stamp their event in the
+    reclaim sweep, so they pass the default and the window keeps its ``limit + 1`` shape.
 
     A PLANNED restart never exhausts it: the host will restart again on its own timer, no number
     of retries changes that, and charging the card would convert `hermes update` into a slow
@@ -174,7 +181,12 @@ def _strike_free_exhausted(conn: sqlite3.Connection, task_id: str, limit: int = 
         "ORDER BY id DESC LIMIT ?",
         (task_id, int(limit) + 1),
     ).fetchall()
-    if len(rows) < int(limit) + 1:
+    if pending_infrastructure:
+        rows = rows[1:]          # the newest is the current attempt; count it as strike-free
+        need = int(limit)
+    else:
+        need = int(limit) + 1
+    if len(rows) < need:
         return False
     for row in rows:
         data = _kb._json_or(row["payload"], {})
@@ -262,6 +274,9 @@ class DispatchResult:
     infrastructure_reopened: list[str] = field(default_factory=list)
     """Task ids re-opened this tick because their give-up was a HOST failure and the
     host probes healthy again (``reopen_infrastructure_gave_ups``)."""
+    silent_burst_reclassified: list[str] = field(default_factory=list)
+    """Task ids whose OLD sticky give-up was recomputed as a silent cross-lane host burst and
+    re-opened (``reclassify_silent_burst_gave_ups``, <= ``INFRA_REOPEN_PER_TICK`` per tick)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1179,6 +1194,38 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
+#: The CLI's session banner is all a worker killed in the handshake ever prints: it names the
+#: session, not the work, so it is not evidence about the card. A worker that re-ran inside the
+#: same log can leave SEVERAL banners behind (measured 2026-11-25: three, one per attempt), and
+#: `_worker_final_output` joins them into one line with spaces — so the test is "nothing but
+#: banners", not "exactly one banner".
+_WORKER_SESSION_BANNER_RE = re.compile(r"(?i)session:\s*\S+")
+
+
+def _silent_crash(error_text: str) -> bool:
+    """True when a dead worker left no output of its own — silence is the HOST's shape.
+
+    A worker the host killed (memory pressure, a dying interpreter, the slice's OOM sweep) never
+    prints: its log holds the ``Session: <id>`` banner and the exit trailer, and
+    ``worker_result.last_output`` is "". Measured 2026-11-25 on the 12:37:45 wave: two cards on
+    two lanes, each a 107-byte log with ``last_output == ""``, both completed on their first
+    allowed run after being booked as card bugs. A crash that quotes real output is a card-level
+    symptom and must stay chargeable.
+
+    ``error_text`` is the dead worker's error: our own head, then ``WORKER_OUTPUT_SEP`` and the
+    worker's last output when ``_worker_final_output`` found any.
+    """
+    _head, sep, output = (error_text or "").partition(WORKER_OUTPUT_SEP)
+    if not sep:
+        return True
+    text = output.strip()
+    if len(text) >= 2 and text[0] in "'\"" and text[-1] == text[0]:
+        text = text[1:-1].strip()
+    if not text:
+        return True
+    return not _WORKER_SESSION_BANNER_RE.sub("", text).strip()
+
+
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1337,6 +1384,32 @@ def _stamp_infrastructure(dead: _DeadWorker) -> bool:
     return True
 
 
+def _mark_crash_event_infrastructure(conn: sqlite3.Connection, task_id: str, **extra) -> None:
+    """Record the host verdict on the ``crashed`` event that already reached the board.
+
+    ``_stamp_infrastructure`` decides this in the reclaim sweep for a crash whose TEXT names a host
+    fault. A silent cross-lane burst is only knowable in ``_account_crashes``, once the whole
+    tick's dead set is counted — after the sweep wrote the event. The flag still has to land on
+    that event, not only on the payload ``_record_task_failure`` may emit: ``_strike_free_exhausted``
+    reads the events, and without the flag the strike-free window never advances, so a card in a
+    repeating burst would retry forever.
+    """
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN ('crashed', 'reclaimed') "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        data = _kb._json_or(row["payload"], {})
+        if not isinstance(data, dict):
+            data = {}
+        data["infrastructure"] = True
+        data.update(extra)
+        conn.execute("UPDATE task_events SET payload = ? WHERE id = ?",
+                     (_kb._json_or_null(data), row["id"]))
+
+
 def _mark_owner_interrupt(dead: _DeadWorker, pid: int) -> None:
     """Book ``dead`` as the owner's own interrupt: no card verdict, no attempt charged.
 
@@ -1456,6 +1529,24 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
+def _crash_assignees(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, Optional[str]]:
+    """``task_id -> assignee`` for one tick's dead cards, in one query (chunked for SQLite's
+    variable limit). The burst rule needs to know whether a fingerprint spans more than one LANE,
+    and ``assignee`` is the only column that answers that: ``claim_lock`` is ``<host>:<pid>``, so
+    every claim on one dispatcher host shares a prefix and "same claim owner" says nothing about
+    the profile that failed.
+    """
+    out: dict[str, Optional[str]] = {}
+    for start in range(0, len(task_ids), 400):
+        chunk = task_ids[start:start + 400]
+        rows = conn.execute(
+            f"SELECT id, assignee FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk
+        ).fetchall()
+        for row in rows:
+            out[row["id"]] = _kb._row_get(row, "assignee")
+    return out
+
+
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
@@ -1464,12 +1555,24 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
     heal them) trip immediately.
+
+    A systemic burst that is SILENT (no worker output) and CROSS-LANE (>= 2 distinct assignees in
+    this tick) is the HOST's, not a shared card bug: it books infrastructure — strike-free, bounded
+    by ``INFRA_STRIKE_FREE_LIMIT`` per card — instead of tripping at one strike (kanban
+    t_369c5661, measured on the 2026-11-25 12:37:45 wave: two lanes, both cards completed on their
+    first allowed run). One lane's bad model/config stays chargeable: the same silence on a single
+    assignee is equally consistent with that profile's own fault.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
+    fp_assignees: dict[str, set] = {}
+    if len(crash_details) >= 3:
+        assignees = _crash_assignees(conn, [tid for tid, _pid, _claimer, _dead in crash_details])
+        for tid, _pid, _claimer, dead in crash_details:
+            fp_assignees.setdefault(_error_fingerprint(dead.error_text), set()).add(assignees.get(tid))
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
@@ -1517,7 +1620,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            fp = _error_fingerprint(error_text)
+            is_systemic = fp_counts.get(fp, 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
             # A host failure (owner handshake silence, gateway drain, no systemd scope) is not the
             # card's attempt failing: book it as infrastructure so it spends no crash strike and a
@@ -1525,6 +1629,24 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             infrastructure = (
                 bool(getattr(dead, "infrastructure", False)) or _infrastructure_failure(error_text)
             ) and not _strike_free_exhausted(conn, tid)
+            if not infrastructure and is_systemic and _silent_crash(error_text):
+                lanes = sorted(x for x in fp_assignees.get(fp, set()) if x)
+                if len(lanes) >= 2:
+                    # Silent + cross-lane: the host could not run these attempts. NOT sticky —
+                    # sticky would hold every card at one strike for a fault none of them caused.
+                    is_systemic = False
+                    # `pending_infrastructure`: this branch stamps the event only after the count,
+                    # so the window is read as if the current crash already carried the flag.
+                    infrastructure = not _strike_free_exhausted(
+                        conn, tid, pending_infrastructure=True)
+                    if infrastructure:
+                        extra["silent_burst"] = True
+                        extra["burst_assignees"] = lanes
+                        # The crash path writes no second event (`end_run=False`), so the verdict
+                        # must land on the `crashed` event the sweep already emitted — with the
+                        # lanes, so `kanban show` says which burst this card belonged to.
+                        _mark_crash_event_infrastructure(
+                            conn, tid, silent_burst=True, burst_assignees=lanes)
             if infrastructure:
                 extra["infrastructure"] = True
                 is_systemic = False        # 3 cards failing on ONE host fault is not 3 card bugs
@@ -2023,6 +2145,183 @@ def reopen_infrastructure_gave_ups(
             )
         _kb._log.warning("kanban dispatcher: re-opened %s — its give-up was a host failure and "
                          "the host probes healthy again", tid)
+        reopened.append(tid)
+    return reopened
+
+
+#: A silent burst is a burst in TIME: the 2026-11-25 12:37:45 wave lost 11 workers inside 40 s,
+#: the 12:26:13 one 12. Two crashes further apart than this are separate events whatever their text.
+SILENT_BURST_WINDOW_S = 10
+#: Same bar the tick classifier uses: fewer than three identical fingerprints is not a burst.
+SILENT_BURST_MIN_CARDS = 3
+#: How far around a candidate's own crash the recompute reads events (a superset of the chain).
+SILENT_BURST_SPAN_S = 120
+
+
+def _crashed_events_with_errors(conn: sqlite3.Connection, lo: int, hi: int) -> list:
+    """``crashed`` events in ``[lo, hi]`` with the dead worker's error and the card's lane.
+
+    The error lives on the run, not on the event payload: ``_end_run`` stores the crash text and
+    the event only carries the exit bookkeeping. A card whose task row is gone cannot be counted
+    as a lane (nothing to reopen, no assignee), so the join is INNER.
+    """
+    return conn.execute(
+        "SELECT e.id, e.task_id, e.created_at, COALESCE(r.error, '') AS error, t.assignee AS assignee "
+        "FROM task_events e "
+        "JOIN tasks t ON t.id = e.task_id "
+        "LEFT JOIN task_runs r ON r.id = e.run_id "
+        "WHERE e.kind = 'crashed' AND e.created_at BETWEEN ? AND ? "
+        "ORDER BY e.created_at, e.id",
+        (int(lo), int(hi)),
+    ).fetchall()
+
+
+def _silent_burst_index(conn: sqlite3.Connection, epochs: list[int]) -> dict[str, dict]:
+    """``task_id -> burst facts`` for every card in a silent, cross-lane burst near ``epochs``.
+
+    Recomputes the tick rule from history: ``crashed`` events carrying the same error fingerprint,
+    chained <= ``SILENT_BURST_WINDOW_S`` apart, spanning >= ``SILENT_BURST_MIN_CARDS`` cards and
+    >= 2 distinct assignees. Only silent cards are indexed (a card that quoted its own output is
+    its own symptom); the chain's lanes and size count every card in it, exactly as
+    ``_account_crashes`` counts the tick. ``epochs`` are the candidate crash times; only the
+    windows around them are read, grouped so one wave costs one query.
+    """
+    if not epochs:
+        return {}
+    index: dict[str, dict] = {}
+    spans: list[tuple[int, int]] = []
+    for at in sorted(set(int(e) for e in epochs)):
+        lo, hi = at - SILENT_BURST_SPAN_S, at + SILENT_BURST_SPAN_S
+        if spans and lo <= spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], hi))
+        else:
+            spans.append((lo, hi))
+    for lo, hi in spans:
+        by_fp: dict[str, list] = {}
+        for event in _crashed_events_with_errors(conn, lo, hi):
+            error = event["error"] or ""
+            if not error:
+                continue
+            by_fp.setdefault(_error_fingerprint(error), []).append(event)
+        for fp, group in by_fp.items():
+            chain = [group[0]]
+            for event in group[1:]:
+                if int(event["created_at"]) - int(chain[-1]["created_at"]) <= SILENT_BURST_WINDOW_S:
+                    chain.append(event)
+                else:
+                    _index_burst(index, fp, chain)
+                    chain = [event]
+            _index_burst(index, fp, chain)
+    return index
+
+
+def _index_burst(index: dict[str, dict], fp: str, chain: list) -> None:
+    """Record one same-fingerprint chain as a burst if it is big and cross-lane enough.
+
+    Lanes and card count come from EVERY card in the chain, exactly as ``_account_crashes`` reads
+    the tick: a wave's loud partners (e.g. the workers that printed the save-loss line before
+    dying) still name the lanes it reached. Only the SILENT cards are indexed, because a card that
+    quoted real output is a symptom of itself, not of the host.
+    """
+    cards = {e["task_id"] for e in chain}
+    lanes = sorted({e["assignee"] for e in chain if e["assignee"]})
+    if len(cards) < SILENT_BURST_MIN_CARDS or len(lanes) < 2:
+        return
+    facts = {"fingerprint": fp, "burst_at": int(chain[-1]["created_at"]),
+             "burst_cards": len(cards), "burst_assignees": lanes}
+    for event in chain:
+        if not _silent_crash(event["error"] or ""):
+            continue
+        index.setdefault(event["task_id"], facts)
+
+
+def reclassify_silent_burst_gave_ups(
+    conn: sqlite3.Connection, *, limit: int = INFRA_REOPEN_PER_TICK, dry_run: bool = False,
+    now: Optional[int] = None, probe_fn=None,
+) -> list[str]:
+    """Re-open the cards an OLD sticky trip blocked for a silent, cross-lane burst.
+
+    Before the burst rule existed, a host-wide silent crash wave took the systemic branch and
+    blocked every card in it ``sticky`` at ``effective_limit: 1`` — 22 cards on the live board.
+    Those payloads carry no ``infrastructure`` flag, so ``reopen_infrastructure_gave_ups`` cannot
+    see them, and their work was never at fault: two cards from one such wave completed on their
+    first allowed run after sitting blocked for 3 h.
+
+    Reclassification is deliberately narrow and auditable: the card's own latest ``crashed`` event
+    must be silent, and it must sit in a burst recomputed from ``task_events`` that spans >= 3 cards
+    and >= 2 assignees within ``SILENT_BURST_WINDOW_S``. Re-opening goes through
+    :func:`hermes_cli.kanban_db.unblock_task` (an operator unblock: retry budget reset, parent
+    re-gating) at ``limit`` per tick, and the ``infrastructure_recovered`` event carries the burst's
+    timestamp, size and lanes so the history says why. A card whose LAST word is ``blocked`` /
+    ``completed`` is never touched — that is a later decision and not ours to overrule.
+
+    ``dry_run`` lists every match without writing; the caller then decides. ``probe_fn`` is an
+    optional extra gate (a live host probe); none is required by default, because the evidence is
+    historical and the per-tick bound plus the lane caps bound the churn.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT t.id, t.last_failure_error, e.payload, e.created_at AS gave_up_at "
+        "FROM tasks t JOIN task_events e ON e.task_id = t.id AND e.kind = 'gave_up' "
+        "WHERE t.status = 'blocked' "
+        "  AND e.created_at = (SELECT MAX(e2.created_at) FROM task_events e2 "
+        "                      WHERE e2.task_id = t.id AND e2.kind = 'gave_up') "
+        "  AND NOT EXISTS (SELECT 1 FROM task_events e3 WHERE e3.task_id = t.id "
+        "                  AND e3.kind IN ('blocked', 'completed', 'review_requested') "
+        "                  AND (e3.created_at > e.created_at "
+        "                       OR (e3.created_at = e.created_at AND e3.id > e.id))) "
+        "ORDER BY e.created_at ASC"
+    ).fetchall()
+
+    candidates: list[tuple[str, int]] = []
+    for row in rows:
+        data = _kb._json_or(row["payload"], {})
+        if not isinstance(data, dict) or not data.get("sticky") or data.get("infrastructure"):
+            continue  # already infrastructure, or not a breaker trip at all
+        gave_up_at = _kb._to_epoch(row["gave_up_at"])
+        if gave_up_at is None or (now - gave_up_at) < INFRA_REOPEN_MIN_AGE_S:
+            continue
+        crash = conn.execute(
+            "SELECT e.created_at, COALESCE(r.error, '') AS error FROM task_events e "
+            "LEFT JOIN task_runs r ON r.id = e.run_id "
+            "WHERE e.task_id = ? AND e.kind = 'crashed' ORDER BY e.id DESC LIMIT 1", (row["id"],),
+        ).fetchone()
+        if crash is None:
+            continue
+        crashed_at = _kb._to_epoch(crash["created_at"])
+        if crashed_at is None or not _silent_crash(crash["error"] or ""):
+            continue
+        candidates.append((row["id"], crashed_at))
+    if not candidates:
+        return []
+
+    index = _silent_burst_index(conn, [at for _tid, at in candidates])
+    hits = sorted(((tid, index[tid]) for tid, _at in candidates if tid in index),
+                  key=lambda pair: pair[1]["burst_at"])
+    if not hits:
+        return []
+    if dry_run:
+        # The operator sees the whole residue; the live path takes `limit` per tick.
+        return [tid for tid, _facts in hits]
+    if probe_fn is not None and not probe_fn():
+        return []
+
+    reopened: list[str] = []
+    for tid, facts in hits[:max(1, int(limit))]:
+        if not _kb.unblock_task(conn, tid):
+            continue
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, tid, "infrastructure_recovered",
+                {"reason": "silent cross-lane burst was the host's",
+                 "reclassified": True, **facts,
+                 "probe": "task_events burst recompute"},
+            )
+        _kb._log.warning(
+            "kanban dispatcher: reclassified %s — its sticky give-up was a silent %d-card burst "
+            "across %s at %s, i.e. a host failure, not a shared bug",
+            tid, facts["burst_cards"], "/".join(facts["burst_assignees"]), facts["burst_at"],
+        )
         reopened.append(tid)
     return reopened
 
@@ -2828,6 +3127,13 @@ def _dispatch_once_locked(
             result.infrastructure_reopened = reopen_infrastructure_gave_ups(conn)
         except Exception as exc:      # a recovery probe must never cost the tick
             _kb._log.warning("kanban dispatcher: infrastructure reopen failed: %s", exc)
+    # The residue an older classifier left behind: a sticky give-up whose card is now provably part
+    # of a SILENT cross-lane burst is re-opened at <=3/tick, with the burst facts on the event.
+    # `dry_run` only LISTS here (it is the operator's preview), never mutates.
+    try:
+        result.silent_burst_reclassified = reclassify_silent_burst_gave_ups(conn, dry_run=dry_run)
+    except Exception as exc:      # a reclassification must never cost the tick
+        _kb._log.warning("kanban dispatcher: silent-burst reclassification failed: %s", exc)
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )

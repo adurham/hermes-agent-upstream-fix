@@ -390,6 +390,14 @@ _SPECS = [
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
         _json_flag(),
     ], help="One dispatcher pass: reclaim stale, promote ready, spawn workers"),
+    _cmd("reclassify-silent-bursts", [
+        _arg("--dry-run", action="store_true",
+             help="List the cards that would be re-opened; write nothing"),
+        _arg("--limit", type=int, default=kbd.INFRA_REOPEN_PER_TICK,
+             help=f"Re-open at most N cards (default: {kbd.INFRA_REOPEN_PER_TICK})"),
+        _json_flag(),
+    ], help="Re-open sticky give-ups a SILENT cross-lane crash burst caused (a host fault, "
+             "not a shared card bug)"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),

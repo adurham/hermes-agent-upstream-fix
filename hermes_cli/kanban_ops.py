@@ -154,6 +154,37 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    if res.silent_burst_reclassified:
+        print(f"Silent-burst reclassified (sticky give-up was the host's): "
+              f"{len(res.silent_burst_reclassified)}")
+        for tid in res.silent_burst_reclassified:
+            print(f"  {tid}")
+    return 0
+
+
+def _cmd_reclassify_silent_bursts(args: argparse.Namespace) -> int:
+    """Reclassify sticky give-ups a SILENT, cross-lane crash burst caused (kanban t_43970201).
+
+    The classifier used to book a host-wide silent crash wave as a shared card bug and block every
+    card in it at one strike, ``sticky``. This recomputes the burst from ``task_events`` and
+    re-opens the cards that are provably in one, <= ``--limit`` per tick, appending
+    ``infrastructure_recovered`` with the burst timestamp.
+    """
+    limit = int(getattr(args, "limit", None) or kbd.INFRA_REOPEN_PER_TICK)
+    dry_run = bool(getattr(args, "dry_run", False))
+    with kbc.connect_closing() as conn:
+        ids = kbd.reclassify_silent_burst_gave_ups(conn, limit=limit, dry_run=dry_run)
+    if getattr(args, "json", False):
+        _print_json({"dry_run": dry_run, "limit": limit, "tasks": ids}, ascii=True)
+        return 0
+    if dry_run:
+        print(f"Would reclassify {len(ids)} card(s): a silent cross-lane burst, not a shared bug.")
+    else:
+        print(f"Reclassified {len(ids)} card(s) (<= {limit} per tick):")
+    for tid in ids:
+        print(f"  {tid}")
+    if ids and not dry_run:
+        print("Each carries an `infrastructure_recovered` event naming the burst it belonged to.")
     return 0
 
 
