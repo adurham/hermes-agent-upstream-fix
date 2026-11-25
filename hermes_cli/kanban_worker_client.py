@@ -378,6 +378,13 @@ async def _await_receipt(client, params, board_db, claim):
 def _exit_code(receipt, params, board_db, *, planned_restart=False, claim=None):
     from hermes_cli.gateway_client import GatewayClientError
     result = _attempt_result(board_db, params)
+    if receipt.get('status') == 'terminal' and receipt.get('outcome') == 'interrupted':
+        # The OWNER stopped this attempt itself (a drain/restart's boot recovery settling an
+        # unattended kanban admission, or a Stop). Nothing of the card ran, so say so in OUR words:
+        # the crash sweep folds this line into the run's error, and a bare session id there reads to
+        # the lane as a worker crash (measured 2026-11-24: 13 dispatches in 4 h).
+        print('Kanban attempt interrupted by its owner at admission: the card was never read and '
+              'nothing in it ran. This is a host event, not a card failure.')
     if receipt['status'] == 'unknown' and not result:
         # Nothing on the board says this attempt's turn ended, and the owner fenced the receipt:
         # refuse, but say WHERE we looked and WHAT we held. Best-effort board record first, so the

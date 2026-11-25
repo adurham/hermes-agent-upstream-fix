@@ -45,6 +45,52 @@ def _admission_row(receipt):
     return (rows[0].status, rows[0].outcome) if rows else None
 
 
+def owner_attempt_interrupted(conn, task_id) -> bool:
+    """True when the OWNER's ledger says it interrupted this run's attempt itself.
+
+    ``status='terminal', outcome='interrupted'`` is the owner's own statement that it stopped the
+    attempt (a drain, a Stop, or boot recovery settling an unattended kanban admission that a
+    restart fenced ``unknown``: ``settle_recovered_unattended``). No verdict about the CARD was
+    reached — a worker that exits 130 on this settlement never read the card — so the crash sweep
+    must book it as the host's interrupt and charge nothing (measured 2026-11-24: 13 dispatches in
+    4 h died at start with ``exit code 130 [owner admission settled interrupted]``, every one of
+    them charged an attempt and read to the lane as a card defect).
+
+    A run the owner recorded a ``worker_lost`` for is NOT this shape: the owner saw the worker's
+    own death (a cgroup OOM, a failed turn) and its interrupted settlement is the consequence, so
+    that verdict stands and the attempt is charged as it always was. ``rate_limited`` settlement
+    is the owner declining for quota, and anything unreadable is not evidence: both return False.
+    """
+    receipt = _owner_receipt(conn, task_id)
+    if receipt is None:
+        return False
+    if _latest_run_event(conn, task_id, 'worker_lost'):
+        return False
+    admission = _admission_row(receipt)
+    return admission is not None and admission[0] == 'terminal' and admission[1] == 'interrupted'
+
+
+#: The sentence a run's error carries when its own owner interrupted the attempt at admission.
+#: Named as a host condition so every infrastructure classifier (``_INFRA_FAILURE_RE``) and the
+#: lane's supervisor read "the owner stopped it", never "the card crashed".
+OWNER_INTERRUPT_TEXT = (
+    "owner interrupted this attempt at admission (the profile owner settled its admission "
+    "interrupted before the card was read) — not a card failure")
+
+
+def owner_interrupt_error(pid, code) -> str:
+    """The error head for an attempt its owner interrupted: what happened, and what it costs.
+
+    It must read as SUPERSEDED, not as a crash: the card was never read, the run stays requeued
+    and the next dispatch starts a fresh attempt, so the lane's supervisor does not report a
+    death and does not spend a turn disproving a card defect.
+    """
+    exit_note = f"exit code {code}" if code is not None else "no exit status"
+    return (f"pid {pid}: {OWNER_INTERRUPT_TEXT}; {exit_note}, nothing in the card ran and this "
+            "attempt is SUPERSEDED — the card stays queued, the next dispatch starts a fresh run, "
+            "and no attempt was charged.")
+
+
 def owner_reclaim_paused(conn, task_id):
     """Missing/ambiguous owner receipts never authorize another attempt."""
     receipt = _owner_receipt(conn, task_id)

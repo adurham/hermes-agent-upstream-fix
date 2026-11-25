@@ -106,6 +106,8 @@ _INFRA_FAILURE_RE = re.compile(
     r"|kanban owner refused"
     r"|gateway draining"
     r"|planned gateway restart"
+    r"|owner interrupted this attempt"
+    r"|owner admission settled interrupted"
     r"|systemd-run --user --scope is unavailable"
     r"|cannot create restart-safe systemd scope"
     r"|no reachable user d-bus session",
@@ -177,8 +179,14 @@ def _strike_free_exhausted(conn: sqlite3.Connection, task_id: str, limit: int = 
 def _infrastructure_verdict(conn: sqlite3.Connection, task_id: str, text: Optional[str], *,
                             host_broken: Optional[bool] = None) -> bool:
     """Host-failure verdict for *task_id*, capped so one card cannot retry strike-free forever."""
-    from hermes_cli.kanban_owner_recovery import _latest_run_event, planned_restart_loss
+    from hermes_cli.kanban_owner_recovery import (_latest_run_event, owner_attempt_interrupted,
+                                                 planned_restart_loss)
     if planned_restart_loss(_latest_run_event(conn, task_id, "worker_lost")):
+        return True
+    # The owner settled this run's admission ``interrupted``: it stopped the attempt itself and no
+    # verdict about the card was reached. Never charged, and never capped — a retry budget cannot
+    # help a host that keeps interrupting, and charging the card is the fault this rule exists for.
+    if owner_attempt_interrupted(conn, task_id):
         return True
     if not _infrastructure_failure(text, host_broken=host_broken):
         return False
@@ -249,6 +257,10 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    owner_interrupted: list[str] = field(default_factory=list)
+    """Task ids whose attempt the profile OWNER settled ``interrupted`` before the card was read
+    (a drain, a restart's boot recovery, a Stop). Requeued with the reason on ``last_failure_error``
+    and NO attempt charged: the lane must never read these as crashes of the card."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1176,12 +1188,20 @@ class _DeadWorker:
     """The host could not run the attempt (owner handshake silence, gateway drain, no
     systemd scope). Set by ``_reclaim_dead_workers`` and stamped into the ``crashed``
     event payload so the board and the keeper can see a host outage as such."""
+    owner_interrupted: bool = False
+    """The OWNER settled this run's admission ``interrupted``: it stopped the attempt itself
+    (drain/restart/Stop) before the card was read. No verdict about the card was reached, so the
+    booking is ``interrupted`` (a run outcome of ``reclaimed``), never ``crashed``, and
+    ``_account_crashes`` must not charge an attempt for it."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        # doesn't show a phantom crash for a quota wall; an attempt the owner interrupted
+        # itself is ``reclaimed`` (no verdict), so the lane never reads it as a card crash.
+        if self.rate_limited:
+            return "rate_limited"
+        return "reclaimed" if self.owner_interrupted else "crashed"
 
 
 def _classify_dead_worker(
@@ -1280,6 +1300,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    # Runs whose own owner settled the admission ``interrupted``: requeued with no verdict and
+    # no attempt charged. Never mixed into ``crashed``/``crash_details``.
+    owner_interrupted: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1305,6 +1328,26 @@ def _stamp_infrastructure(dead: _DeadWorker) -> bool:
     return True
 
 
+def _mark_owner_interrupt(dead: _DeadWorker, pid: int) -> None:
+    """Book ``dead`` as the owner's own interrupt: no card verdict, no attempt charged.
+
+    The exit code (130 on a manager's Stop, 1 on a killed interpreter) is a symptom, so the error
+    head says what actually happened and the event kind is ``interrupted`` — the board, the lane's
+    supervisor and the notifier must be able to tell "the lane never started it" from "it crashed".
+    The worker's own last words are kept after the head, as for any other dead worker.
+    """
+    from hermes_cli.kanban_owner_recovery import owner_interrupt_error
+    dead.owner_interrupted = True
+    dead.event_kind = "interrupted"
+    _head, sep, output = dead.error_text.partition(WORKER_OUTPUT_SEP)
+    dead.error_text = owner_interrupt_error(pid, dead.code) + (sep + output if sep else "")
+    dead.event_payload.update({
+        "owner_interrupted": True,
+        "attempt_charged": False,
+        "reason": "owner admission settled interrupted",
+    })
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
@@ -1315,7 +1358,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import (apply_attempt_note, managed_run_exit_code,
+                                                      owner_attempt_interrupted, owner_reclaim_blocked)
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1337,6 +1381,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            # The OWNER's own ledger outranks the exit code: when it settled this run's admission
+            # ``interrupted`` it stopped the attempt itself (a drain, a restart's boot recovery
+            # settling an unattended kanban admission, a Stop) and the card was never read. That
+            # is not a crash and must charge nothing — 13 of 241 runs in one 4 h window were booked
+            # ``crashed`` on exactly this settlement, each burning an attempt and reading to the
+            # lane as a card defect (2026-11-24).
+            if owner_attempt_interrupted(conn, row["id"]):
+                _mark_owner_interrupt(dead, pid)
             # Stamp the host-failure verdict on the record that actually reaches the board: the
             # `crashed` event and the run metadata are written below from `event_payload`, and a
             # host fault must be visible there (the keeper files its HOST card off this marker).
@@ -1381,6 +1433,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.owner_interrupted:
+                # No verdict was reached about the card, so the counter must not move and the
+                # breaker must not see it: _account_crashes never receives this booking.
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (dead.error_text[:500], row["id"]),
+                )
+                sweep.owner_interrupted.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1495,6 +1555,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_owner_interrupted = sweep.owner_interrupted  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -2583,6 +2644,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.owner_interrupted.extend(getattr(detect_crashed_workers, "_last_owner_interrupted", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

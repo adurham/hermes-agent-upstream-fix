@@ -220,8 +220,9 @@ def test_a_settled_admission_is_proof_even_while_the_owner_gateway_is_alive(boar
         "SELECT outcome, error FROM task_runs WHERE task_id = 't_gateway'").fetchone()
     assert run["outcome"] == "reclaimed"
     assert "owner admission settled interrupted" in run["error"]
-    # Booked against the breaker like any other non-completing attempt (A3).
-    assert board.state("t_gateway")["consecutive_failures"] == 1
+    # The owner settled this admission interrupted: it stopped the attempt itself and no verdict
+    # about the card was reached, so the breaker must not see it (`owner_attempt_interrupted`).
+    assert board.state("t_gateway")["consecutive_failures"] == 0
     assert board.state("t_bound")["status"] == "running"
 
 

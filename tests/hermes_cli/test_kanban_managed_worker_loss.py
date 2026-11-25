@@ -9,7 +9,8 @@ lost attempt:
   A2  an elapsed ``claim_expires`` never leaves the card ``running`` after one tick, even
       with no heartbeat and no pid (and even behind a settled owner receipt);
   A3  every such booking increments ``consecutive_failures``, so ``kanban.failure_limit``
-      covers this outcome class and the card blocks at the limit.
+      covers this outcome class and the card blocks at the limit — EXCEPT an attempt the
+      owner settled ``interrupted`` itself, which is not a card verdict and charges nothing;
 """
 
 from __future__ import annotations
@@ -205,20 +206,22 @@ def test_a_crash_whose_output_quotes_protocol_violation_is_not_one(board):
 
 # --- A2: an elapsed claim lock is never "still running" after one tick ---------------------
 
-@pytest.mark.parametrize("shape, error", [
-    (dict(record_worker_pid=False, owner=False), "stale_lock="),
-    (dict(record_worker_pid=False, owner=True), "owner admission settled interrupted"),
-    (dict(owner=False), "stale_lock="),
-    (dict(owner=True, worker_lost="managed_worker_failed"), "managed worker lost: managed_worker_failed"),
+@pytest.mark.parametrize("shape, error, failures", [
+    (dict(record_worker_pid=False, owner=False), "stale_lock=", 1),
+    # The owner's own interrupt is not a card verdict: requeued with no attempt charged
+    # (``owner_attempt_interrupted``).
+    (dict(record_worker_pid=False, owner=True), "owner admission settled interrupted", 0),
+    (dict(owner=False), "stale_lock=", 1),
+    (dict(owner=True, worker_lost="managed_worker_failed"), "managed worker lost: managed_worker_failed", 1),
 ], ids=["no-pid", "no-pid-receipt", "dead-pid", "dead-pid-lost"])
-def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error):
+def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error, failures):
     run_id = board.running("t_lapsed", claim_expires_in=CLAIM_LAPSED, heartbeat_age=None, **shape)
     board.tick(failure_limit=2)
     row, run = board.state("t_lapsed"), board.run(run_id)
     assert row["status"] == "ready"
     assert run["outcome"] == "reclaimed"
     assert error in run["error"]
-    assert row["consecutive_failures"] == 1
+    assert row["consecutive_failures"] == failures
 
 
 def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(board):
