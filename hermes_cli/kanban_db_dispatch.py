@@ -110,7 +110,16 @@ _INFRA_FAILURE_RE = re.compile(
     r"|owner admission settled interrupted"
     r"|systemd-run --user --scope is unavailable"
     r"|cannot create restart-safe systemd scope"
-    r"|no reachable user d-bus session",
+    r"|no reachable user d-bus session"
+    # Hermes's own session-save loss (the English ``session_persistence_failed`` text in
+    # locales/en.yaml). Measured 2026-11-25: 12 workers exited 1 in the same second on DB
+    # contention with 12-24 workers sharing one profile ``state.db``; the loss text reached
+    # ``last_failure_error`` for 26 blocked cards, but the closed set above did not know it, so
+    # the shared fingerprint took the systemic branch and blocked every card stickily at one
+    # strike. These three phrases can never be a card's bug, so they belong here.
+    r"|couldn't save this conversation"
+    r"|drive is out of room"
+    r"|another Hermes process is holding the database",
     re.IGNORECASE,
 )
 #: Ambiguous on purpose: a managed-worker hello timeout ALSO fires when one card's worker wedges at

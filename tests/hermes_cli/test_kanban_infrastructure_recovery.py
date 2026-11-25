@@ -126,6 +126,91 @@ def test_a_real_crash_still_trips_the_breaker(conn):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Hermes's own session-save loss (storage / DB contention) is the host's
+# ---------------------------------------------------------------------------
+
+# The English ``session_persistence_failed`` sentence (locales/en.yaml) as it reached
+# ``last_failure_error`` on 26 cards on 2026-11-25: 12-24 workers on one profile ``state.db``.
+STORAGE_LOSS = (
+    "pid 506084 exited with code 1 [managed worker lost: managed_worker_failed "
+    "[oom_kill=0; cgroup peak 1.10 GiB of 6.00 GiB cap]] Worker's last output: "
+    "\"Session: local-580e26a8 ⚠️ No reply: Hermes couldn't save this conversation, so it "
+    "stopped rather than lose your messages. Possible causes: the drive is out of room, or "
+    "another Hermes process is holding the database. Close other Hermes windows, run "
+    "`hermes doctor` to check storage, then send your message again.\""
+)
+
+
+def _crash_with_storage_loss(conn, tid):
+    """The reclaim sweep's shape: stamp the verdict, write the `crashed` event, then charge it."""
+    dead = _dead(STORAGE_LOSS)
+    kbd._stamp_infrastructure(dead)
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, dead.event_kind, dead.event_payload)
+    kbd._account_crashes(conn, [(tid, 999999, "test", dead)])
+
+
+def test_storage_loss_books_as_infrastructure_not_a_strike(conn):
+    assert kbd._infrastructure_failure(STORAGE_LOSS) is True
+    tid = kb.create_task(conn, title="state.db contention", assignee="w")
+    assert kb.claim_task(conn, tid) is not None
+
+    _crash_with_storage_loss(conn, tid)
+
+    assert _failures(conn, tid) == 0, "Hermes failing to save is not the card's failure"
+    assert _status(conn, tid) != "blocked"
+    assert not _events(conn, tid, "gave_up")
+    crashed = _events(conn, tid, "crashed")
+    assert crashed and kb._json_dict(crashed[-1][0]).get("infrastructure") is True
+
+
+def test_a_burst_of_storage_losses_does_not_trip_the_systemic_breaker(conn):
+    """The measured 2026-11-25 shape: many workers lost in one second on ONE host fault.
+
+    Every crash shares the 80-char fingerprint (same normalized ``pid ... exited with code 1
+    [managed worker lost: managed_worker_failed [oom_kill=0`` prefix), so without the storage
+    strings the systemic branch trips each card at ``effective_limit: 1``, sticky.
+    """
+    tids = []
+    for n in range(4):
+        tid = kb.create_task(conn, title=f"state.db contention {n}", assignee="w")
+        assert kb.claim_task(conn, tid) is not None
+        tids.append(tid)
+
+    for tid in tids:
+        _crash_with_storage_loss(conn, tid)
+
+    for tid in tids:
+        assert _failures(conn, tid) == 0, "one host fault must not charge any card a strike"
+        assert _status(conn, tid) != "blocked", "a shared host fault must not block the lane"
+        assert not _events(conn, tid, "gave_up"), "the systemic branch must stay unreachable"
+        assert not any(
+            kb._json_dict(payload[0]).get("sticky") for payload in _events(conn, tid, "crashed")
+        )
+
+
+def test_a_storage_loss_gave_up_reopens_from_the_error_text_alone(conn):
+    """The live 2026-11-25 shape: the old `gave_up` payload has no `infrastructure` flag.
+
+    `_gave_up_was_infrastructure` falls back to `_infrastructure_failure(last_failure_error)`,
+    so the already-blocked cards re-open without a mass unblock.
+    """
+    tid = _blocked_with_gave_up(conn, payload={
+        "failures": 1, "effective_limit": 1, "limit_source": "dispatcher", "sticky": True,
+        "trigger_outcome": "crashed", "error": STORAGE_LOSS,
+    })
+
+    reopened = kbd.reopen_infrastructure_gave_ups(
+        conn, probe_fn=lambda: True, now=int(time.time()) + kbd.INFRA_REOPEN_MIN_AGE_S + 1,
+    )
+
+    assert reopened == [tid]
+    assert _status(conn, tid) == "ready"
+    assert _failures(conn, tid) == 0
+    assert _events(conn, tid, "infrastructure_recovered")
+
+
+# ---------------------------------------------------------------------------
 # 3. A gave-up-on-infrastructure card re-opens itself once the host recovers
 # ---------------------------------------------------------------------------
 
