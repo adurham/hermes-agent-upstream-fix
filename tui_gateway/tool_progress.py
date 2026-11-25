@@ -477,6 +477,13 @@ _SUBAGENT_FIELDS = (
     ("files_read", bool, _str_list), ("files_written", bool, _str_list), ("output_tail", bool, list),
     ("tool_name", bool, str), ("text", bool, str), ("status", bool, str), ("summary", bool, str),
     ("duration_seconds", _not_none, float),
+    # Live model identity (``_identity_kwargs`` -> ``effective_model_fields``): the model ACTUALLY
+    # answering, so a row that silently failed over is not painted as its dispatch-time assignment
+    # until the next snapshot poll. ``provider``/``model_label`` are strings, the rest plain values.
+    ("provider", bool, str), ("fallback_active", _not_none, bool),
+    ("primary_model", bool, str), ("primary_provider", bool, str), ("model_label", bool, str),
+    # WHO the child runs as (persona + profile), fixed at dispatch — never re-resolved.
+    ("agent_type", bool, str), ("profile", bool, str),
 )
 
 

@@ -96,3 +96,52 @@ it('retires the live frame only after every child settles, without depending on 
   act(() => upsertSubagent('owner', { subagent_id: 'child', status: 'completed' }, false, 'subagent.complete'))
   expect(screen.queryByText('Live task')).toBeNull()
 })
+
+it('names what each live child runs on and as: model, persona and profile', () => {
+  upsertSubagent('owner', {
+    subagent_id: 'child',
+    goal: 'Audit the migration',
+    model: 'deepseek-v4.1-flash',
+    agent_type: 'researcher',
+    profile: 'default'
+  })
+
+  const view = render(
+    <MemoryRouter>
+      <ComposerStatusStack queue={null} sessionId="owner" />
+    </MemoryRouter>
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: /1 Subagent/ }))
+  const identity = view.container.querySelector('[data-slot="composer-subagent-identity"]')
+  expect(identity?.textContent).toBe('deepseek-v4.1-flash · researcher · default')
+})
+
+it('marks a failed-over model and shows a persona-less child without a blank slot', () => {
+  upsertSubagent('owner', { subagent_id: 'child', goal: 'Fix the build', model: 'glm-5.3', profile: 'work' })
+  act(() =>
+    upsertSubagent(
+      'owner',
+      {
+        subagent_id: 'child',
+        model: 'claude-opus-5',
+        fallback_active: true,
+        model_label: '⚠ claude-opus-5 (fallback from glm-5.3)',
+        profile: 'work'
+      },
+      false,
+      'subagent.progress'
+    )
+  )
+
+  const view = render(
+    <MemoryRouter>
+      <ComposerStatusStack queue={null} sessionId="owner" />
+    </MemoryRouter>
+  )
+
+  fireEvent.click(screen.getByRole('button', { name: /1 Subagent/ }))
+  const identity = view.container.querySelector('[data-slot="composer-subagent-identity"]')
+  expect(identity?.textContent).toBe('⚠ claude-opus-5 · work')
+  expect(identity?.getAttribute('title')).toBe('⚠ claude-opus-5 (fallback from glm-5.3)')
+})

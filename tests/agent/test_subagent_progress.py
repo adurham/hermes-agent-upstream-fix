@@ -92,6 +92,28 @@ class TestBuildChildProgressCallback:
         assert "tool_4" in summary_text
 
 
+    def test_relays_persona_and_profile_with_every_event(self):
+        """The child's persona (agent_type) and profile ride every relayed event, so a
+        roster can name WHO a child runs as before the first snapshot poll — and a
+        persona-less or unrouted child simply omits the key instead of sending ''."""
+        parent = MagicMock()
+        parent._delegate_spinner = None
+        parent_cb = MagicMock()
+        parent.tool_progress_callback = parent_cb
+
+        named = _build_child_progress_callback(
+            0, "goal", parent, subagent_id="child", agent_type="researcher", profile="work")
+        unnamed = _build_child_progress_callback(1, "goal", parent, subagent_id="other")
+
+        assert named is not None and unnamed is not None
+        named("tool.started", "read_file", "a", {})
+        unnamed("tool.started", "read_file", "b", {})
+
+        by_id = {c.kwargs.get("subagent_id"): c.kwargs for c in parent_cb.call_args_list}
+        assert by_id["child"]["agent_type"] == "researcher"
+        assert by_id["child"]["profile"] == "work"
+        assert "agent_type" not in by_id["other"] and "profile" not in by_id["other"]
+
     def test_parallel_callbacks_independent(self):
         """Each child's callback batches tool names independently."""
         parent = MagicMock()

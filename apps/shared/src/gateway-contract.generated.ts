@@ -625,6 +625,7 @@ export interface Route {
   fallback_active?: boolean
   primary_model?: string | null
   primary_provider?: string | null
+  reason?: string | null
 }
 export interface McpServerStatus {
   name?: string
@@ -2520,6 +2521,8 @@ export interface SubagentSnapshot {
   primary_model?: string | null
   primary_provider?: string | null
   model_label?: string | null
+  agent_type?: string | null
+  profile?: string | null
   child_session_id?: string | null
 }
 /** Lifecycle of one delegated child (``tools/delegate_tool_child_run.py``); ``failed`` / ``error`` / ``timeout`` / ``interrupted`` / ``completed`` are terminal. */
@@ -6271,6 +6274,8 @@ export interface SubagentEventPayload {
   model_label?: string | null
   primary_model?: string | null
   primary_provider?: string | null
+  agent_type?: string | null
+  profile?: string | null
   tool_count?: number | null
   toolsets?: string[] | null
   input_tokens?: number | null

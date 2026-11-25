@@ -16,6 +16,10 @@ _SUBAGENT_SNAPSHOT_FIELDS = (
     # model that is ACTUALLY answering, so a child that silently failed over shows its fallback
     # rather than the model it was dispatched with.
     "provider", "fallback_active", "primary_model", "primary_provider", "model_label",
+    # WHO the child runs as, next to what it runs on: its persona (``agent_type``, the role whose
+    # prompt shapes it) and the profile it was routed under (``profile``, the launching profile when
+    # the task carried no profile route). Both fixed at dispatch.
+    "agent_type", "profile",
 )
 _SUBAGENT_TAIL_BYTES = 16384
 

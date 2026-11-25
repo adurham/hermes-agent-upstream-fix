@@ -17,7 +17,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from tools import file_state
 from tools.delegate_tool_config import _get_child_timeout, _get_subagent_approval_callback, _get_worktree_isolation
-from tools.delegate_tool_progress import _quiet, _resolve_workspace_hint, _safe_progress
+from tools.delegate_tool_progress import _quiet, _resolve_workspace_hint, _safe_progress, child_profile_label
 from tools.delegate_tool_registry import (
     _capture_gateway_steer_authority, _close_subagent_steering, _mark_subagent_resumable, _register_subagent,
     _unregister_subagent,
@@ -78,6 +78,17 @@ def _num(value: Any, default: int = 0) -> int:
 
 def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
+
+
+def _child_profile_name(child: Any) -> Optional[str]:
+    """The profile (config/keys/skills identity) a child runs as.
+
+    A profile-routed child names its route's home; every other child runs as the
+    profile this process is serving. Resolved at registration, while the child's
+    own route stamp is still authoritative.
+    """
+    return child_profile_label(getattr(child, "_delegate_profile_home", None))
+
 
 def _tier_in_effect(child: Any) -> Any:
     """The child's speed tier: its own (a route's tier), else the one its request settings carry (an inherited
@@ -505,6 +516,13 @@ def _register_child(
         "goal": goal,
         "delegation_id": _str_or_none(getattr(child, "_delegation_id", None)),
         "model": _str_or_none(getattr(child, "model", None)),
+        # WHO this child is running as, next to what it runs on: the persona
+        # (``agent_type``, e.g. "researcher") whose prompt shapes it, and the
+        # profile (config/keys/skills identity) it was routed under. Both are
+        # fixed at dispatch, so unlike the model they are stamped once here and
+        # every subagent surface (Desktop composer roster, CLI dock) reads them.
+        "agent_type": _str_or_none(getattr(child, "_delegate_agent_type", None)) or None,
+        "profile": _child_profile_name(child),
         "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child,
         # Owning conversation's durable session id (same lineage completion delivery routes by), sourced from the
         # child's stamp so it survives a parent_agent rebuild between dispatch and run; used for list/steer/stop

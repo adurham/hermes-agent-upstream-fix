@@ -18,6 +18,20 @@ interface SubagentSectionProps {
   sessionId: string
 }
 
+/** What the child is running ON and AS: effective model (⚠ when it silently
+ *  failed over), persona and profile. All three answer "which subagent is this
+ *  really", so they share one line ahead of the latest activity — the goal is
+ *  the only thing that may be truncated away, never the identity. */
+function identityParts(item: SubagentProgress): string[] {
+  const model = item.model?.trim() || item.modelLabel?.trim() || ''
+
+  return [
+    model ? `${item.fallbackActive ? '⚠ ' : ''}${model}` : '',
+    item.agentType?.trim() || '',
+    item.profile?.trim() || ''
+  ].filter(Boolean)
+}
+
 /** A composer-local roster: never borrow the global Agents panel's scope. */
 export function SubagentSection({ sessionId }: SubagentSectionProps) {
   const { t } = useI18n()
@@ -34,34 +48,53 @@ export function SubagentSection({ sessionId }: SubagentSectionProps) {
     return null
   }
 
-  const row = (item: SubagentProgress) => (
-    <StatusRow
-      expanded={selected === item.id}
-      key={item.id}
-      leading={
-        <GlyphSpinner
-          ariaLabel={item.status === 'queued' ? t.agents.queued : t.agents.running}
-          className="text-(--ui-purple)"
-          spinner="braille"
-        />
-      }
-      onActivate={() => setSelected(selected === item.id ? null : item.id)}
-      trailing={
-        <ActivityTimerText
-          className="shrink-0 text-[0.65rem]"
-          seconds={Math.max(0, Math.floor((nowMs - item.startedAt) / 1000))}
-        />
-      }
-      trailingVisible
-    >
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-xs text-(--ui-text-primary)">{item.goal}</span>
-        <span className="block truncate text-[0.68rem] text-(--ui-text-tertiary)">
-          {item.stream.at(-1)?.text || (item.status === 'queued' ? t.agents.queued : t.agents.waitingActivity)}
+  const row = (item: SubagentProgress) => {
+    const identity = identityParts(item)
+    const activity = item.stream.at(-1)?.text || (item.status === 'queued' ? t.agents.queued : t.agents.waitingActivity)
+
+    return (
+      <StatusRow
+        expanded={selected === item.id}
+        key={item.id}
+        leading={
+          <GlyphSpinner
+            ariaLabel={item.status === 'queued' ? t.agents.queued : t.agents.running}
+            className="text-(--ui-purple)"
+            spinner="braille"
+          />
+        }
+        onActivate={() => setSelected(selected === item.id ? null : item.id)}
+        trailing={
+          <ActivityTimerText
+            className="shrink-0 text-[0.65rem]"
+            seconds={Math.max(0, Math.floor((nowMs - item.startedAt) / 1000))}
+          />
+        }
+        trailingVisible
+      >
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-xs text-(--ui-text-primary)">{item.goal}</span>
+          <span className="flex min-w-0 items-baseline gap-1.5 text-[0.68rem] leading-4">
+            {identity.length > 0 && (
+              <span
+                className="max-w-[60%] shrink-0 truncate text-(--ui-text-secondary)"
+                data-slot="composer-subagent-identity"
+                title={item.modelLabel || undefined}
+              >
+                {identity.join(' · ')}
+              </span>
+            )}
+            {identity.length > 0 && (
+              <span aria-hidden className="shrink-0 text-(--ui-text-tertiary)">
+                ·
+              </span>
+            )}
+            <span className="min-w-0 truncate text-(--ui-text-tertiary)">{activity}</span>
+          </span>
         </span>
-      </span>
-    </StatusRow>
-  )
+      </StatusRow>
+    )
+  }
 
   const detail = live.find(item => item.id === selected)
 

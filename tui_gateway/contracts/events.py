@@ -658,6 +658,10 @@ class SubagentEventPayload(Payload):
     model_label: str | None = None
     primary_model: str | None = None
     primary_provider: str | None = None
+    # FORK: WHO the child runs as (see tools/delegate_tool_progress._identity_kwargs): the persona
+    # (agent_type) whose prompt shapes it and the profile it was routed under. Fixed at dispatch.
+    agent_type: str | None = None
+    profile: str | None = None
     tool_count: int | None = None
     toolsets: list[str] | None = None
     input_tokens: int | None = None

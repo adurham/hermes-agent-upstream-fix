@@ -344,6 +344,27 @@ def _print_completion_line(parent_agent: Any, spinner_ref: Any, line: str, conso
 def _short(text: str, n: int) -> str:
     return (text[:n] + "...") if len(text) > n else text
 
+
+def child_profile_label(profile_home: Any = None) -> Optional[str]:
+    """Name of the profile a child runs as.
+
+    ``profile_home`` is a route's profile directory (``TaskRoute.profile_home``);
+    ``None`` means the child was not profile-routed and runs as the profile this
+    process is serving. Display-only: never used to resolve a scope, only to
+    NAME the identity a subagent surface shows.
+    """
+    if profile_home is not None:
+        name = getattr(profile_home, "name", None)
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    with _quiet(None):
+        from hermes_cli.profiles import current_profile_name
+        name = current_profile_name()
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
 # Streamed thinking text that reads like the START of a final answer (not embedded in a
 # tool call's rationale). Flips a swarm-board row "running" → "summarizing" so a user can
 # tell children that are nearly done from those still iterating. Heuristic: patterns are
@@ -372,6 +393,7 @@ class _ChildProgressRelay:
     def __init__(
         self, task_index: int, goal: str, spinner: Any, parent_cb: Any, task_count: int,
         subagent_id, parent_id, depth, model, toolsets, session_ref, agent_ref=None, parent_agent=None,
+        agent_type=None, profile=None,
     ) -> None:
         self.task_index, self.task_count, self.goal_label = task_index, task_count, (goal or "").strip()
         # session_ref is a SHARED dict filled in later by the caller — keep the identity.
@@ -382,6 +404,10 @@ class _ChildProgressRelay:
         self.subagent_id, self.parent_id, self.depth, self.model, self.toolsets = (
             subagent_id, parent_id, depth, model, toolsets
         )
+        # WHO this child runs as (persona + profile), fixed at dispatch: relayed on
+        # every event so a surface can name them before the first snapshot poll.
+        self.agent_type = (agent_type or "").strip() or None
+        self.profile = (profile or "").strip() or None
         # agent_ref is a SHARED mutable slot (same late-binding pattern as session_ref,
         # since the relay is constructed BEFORE the child agent exists) into which the
         # caller drops a weakref to the child. Keep the identity, never copy.
@@ -453,6 +479,10 @@ class _ChildProgressRelay:
                 kw[key] = identity[key]
         for key in ("fallback_active", "primary_model", "primary_provider", "model_label"):
             kw[key] = identity[key]
+        # Dispatch-fixed identity of WHO this child is, not just what it runs on.
+        for key in ("agent_type", "profile"):
+            if getattr(self, key):
+                kw[key] = getattr(self, key)
         if self.toolsets is not None:
             kw["toolsets"] = list(self.toolsets)
         # child_session_id / delegation_id are filled into the shared ref once
@@ -578,6 +608,7 @@ def _build_child_progress_callback(
     parent_id: Optional[str] = None, depth: Optional[int] = None, model: Optional[str] = None,
     toolsets: Optional[list[str]] = None, session_ref: Optional[dict[str, Any]] = None,
     agent_ref: Optional[dict[str, Any]] = None,
+    agent_type: Optional[str] = None, profile: Optional[str] = None,
 ) -> Optional[callable]:
     """Relay for one child's events (see ``_ChildProgressRelay``), or None when the parent has neither a spinner nor a
     progress callback — the child then runs with no progress callback at all (zero behavior change)."""
@@ -590,7 +621,7 @@ def _build_child_progress_callback(
         session_ref["_parent_scope"] = parent_agent
     relay = _ChildProgressRelay(
         task_index, goal, spinner, parent_cb, task_count, subagent_id, parent_id, depth, model, toolsets, session_ref,
-        agent_ref, parent_agent,
+        agent_ref, parent_agent, agent_type=agent_type, profile=profile,
     )
     relay.parent_scope = parent_agent
     return relay

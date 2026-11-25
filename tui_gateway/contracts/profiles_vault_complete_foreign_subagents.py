@@ -691,6 +691,11 @@ class SubagentSnapshot(Result):
     primary_model: str | None = None
     primary_provider: str | None = None
     model_label: str | None = None
+    #: WHO the child runs as, next to what it runs on: the persona (``agent_type``) whose prompt
+    #: shapes it, and the profile (config/keys/skills identity) it was routed under — the launching
+    #: profile when the task carried no profile route.
+    agent_type: str | None = None
+    profile: str | None = None
     #: The child's own stored session (``session.transcript`` reads it by ``subagent_id``); None until it has one.
     child_session_id: str | None = None
 

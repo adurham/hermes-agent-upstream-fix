@@ -19,6 +19,9 @@ _SUBAGENT_FIELDS = (
     # Effective-model identity, resolved live per read (``subagent_snapshot``): ``model`` is what the
     # child is ACTUALLY answering with, so a silently failed-over child is not shown as its assignment.
     'provider', 'fallback_active', 'primary_model', 'primary_provider', 'model_label',
+    # WHO the child runs as, next to what it runs on: its persona (``agent_type``) and the profile it
+    # was routed under (``profile``; the launching profile when the task carried no profile route).
+    'agent_type', 'profile',
 )
 _TAIL_BYTES = 16384
 _PROCESS_TAIL_CHARS = 32768  # main's dock tail view (cli_process_dock.process_tail)

@@ -36855,6 +36855,18 @@
             ],
             "default": null,
             "title": "Primary Provider"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
           }
         },
         "title": "Route",
@@ -44990,6 +45002,30 @@
             "default": null,
             "title": "Primary Provider"
           },
+          "agent_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Type"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
           "tool_count": {
             "anyOf": [
               {
@@ -45511,6 +45547,30 @@
             ],
             "default": null,
             "title": "Model Label"
+          },
+          "agent_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Type"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
           },
           "child_session_id": {
             "anyOf": [

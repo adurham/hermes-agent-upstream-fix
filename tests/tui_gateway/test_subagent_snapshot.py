@@ -351,6 +351,35 @@ def test_list_reports_the_model_that_is_actually_answering_for_a_running_fallbac
         _unregister_subagent("steady")
 
 
+def test_list_names_the_persona_and_profile_each_child_runs_as(runtime, monkeypatch):
+    """The roster names WHO a child runs as next to what it runs on: a profile-routed
+    child reports the route's profile, an unrouted one the profile this process serves."""
+    from pathlib import Path
+
+    from hermes_cli import profiles
+    from tools.delegate_tool_child_run import _register_child
+    from tools.delegate_tool_registry import _unregister_subagent
+
+    _server, owner, transport, call = runtime
+    monkeypatch.setattr(profiles, "current_profile_name", lambda default=None: "launch")
+
+    routed = SimpleNamespace(_subagent_id="routed", _delegate_depth=1, model="test",
+                             _delegate_agent_type="researcher",
+                             _delegate_profile_home=Path("/home/u/.hermes/profiles/work"))
+    unrouted = SimpleNamespace(_subagent_id="plain", _delegate_depth=1, model="test")
+    for child in (routed, unrouted):
+        _register_child(child, None, "task", owner_session_id="ui-owner",
+                        owner_transport=transport, owner_session_record=owner)
+    try:
+        rows = {r["subagent_id"]: r for r in call("subagent.list")["result"]["subagents"]}
+        assert (rows["routed"]["agent_type"], rows["routed"]["profile"]) == ("researcher", "work")
+        # No persona requested, no profile route: the launching profile, and no invented persona.
+        assert (rows["plain"]["agent_type"], rows["plain"]["profile"]) == (None, "launch")
+    finally:
+        _unregister_subagent("routed")
+        _unregister_subagent("plain")
+
+
 def test_list_surfaces_failed_delegations_that_outlived_the_live_roster(runtime):
     """A failed child is gone from the live roster (ended, or a renderer reload dropped it); the
     durable row still reaches ``delegations`` for its own session only (#97202)."""

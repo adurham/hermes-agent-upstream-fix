@@ -43,7 +43,7 @@ from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origi
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _build_child_progress_callback,
     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
-    _safe_progress, format_batch_tag, format_subagent_failure_line,
+    _safe_progress, child_profile_label, format_batch_tag, format_subagent_failure_line,
 )
 from tools.delegate_tool_registry import (
     _CONTROL_ACTIONS, _active_subagents, _active_subagents_lock, _capture_gateway_steer_authority,
@@ -358,6 +358,9 @@ def _build_child_agent(
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
         model=model or getattr(parent_agent, "model", None), toolsets=child_toolsets, session_ref=child_session_ref,
         agent_ref=child_agent_ref,
+        # WHO the child runs as (persona + profile), fixed at dispatch: relayed with every
+        # event so a roster can name them before the child agent even exists.
+        agent_type=agent_type, profile=child_profile_label(profile_home),
     )
     with delegated_profile_scope(profile_home):
         rt = _resolve_child_runtime(

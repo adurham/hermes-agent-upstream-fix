@@ -33,6 +33,10 @@ export interface SubagentProgress {
   primaryProvider?: null | string
   /** Backend-prerendered display string, e.g. "⚠ claude-opus-5 (fallback from glm-5.3)". */
   modelLabel?: string
+  /** Persona/role whose prompt shapes the child (e.g. "researcher"); absent for a persona-less child. */
+  agentType?: string
+  /** Profile the child was routed under (config/keys/skills identity); the launching profile when unrouted. */
+  profile?: string
   status: SubagentStatus
   taskCount: number
   taskIndex: number
@@ -254,6 +258,8 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     primaryModel: nullableStr(payload.primary_model, prev?.primaryModel),
     primaryProvider: nullableStr(payload.primary_provider, prev?.primaryProvider),
     modelLabel: str(payload.model_label) || prev?.modelLabel,
+    agentType: str(payload.agent_type) || prev?.agentType,
+    profile: str(payload.profile) || prev?.profile,
     status,
     taskCount: num(payload.task_count) ?? prev?.taskCount ?? 1,
     taskIndex: num(payload.task_index) ?? prev?.taskIndex ?? 0,
