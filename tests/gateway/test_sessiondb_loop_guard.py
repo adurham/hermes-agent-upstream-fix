@@ -33,6 +33,10 @@ KEPT_ON_LOOP = {
     ('gateway/session_cron.py', '_create'),
     # The routing index's one-time load in a fresh process.
     ('gateway/session_persistence.py', '_load_routing_rows_locked'),
+    # A queued row's verbs: one ``sessions.get`` per session, cached in ``authority.launch_sources``
+    # for every later call. It is the ``flush_for_read`` read, which never waits behind another
+    # connection's write, so it cannot park the loop on someone else's transaction.
+    ('gateway/session_queued_controls.py', '_interactive'),
 }
 # The hot paths: a running cron job's poll (every <= 2 s per job) and the FIFO claim's reads (every
 # turn). Their direct reads (the innermost caller of the store) must never be on the loop again.
