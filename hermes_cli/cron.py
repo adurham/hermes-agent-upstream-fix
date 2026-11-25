@@ -4,7 +4,7 @@ import contextlib
 import json
 import re
 import sys
-from datetime import timezone, UTC
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -454,12 +454,66 @@ def _print_store_unwritable(report: dict, *, brief: bool = False) -> None:
     print(color(f"  Fix: {report['fix']}. Each due job then fires once on the next tick.", Colors.YELLOW))
 
 
+def _print_estop_notice() -> bool:
+    """Print the ESTOP block and return True while dispatch is PAUSED.
+
+    An engaged ESTOP is the one state where every liveness signal here is honest and useless:
+    the ticker's heartbeat is written after every cycle OUTSIDE the ESTOP gate
+    (``cron/scheduler_provider.py``), the last-success marker stays fresh because a refused tick
+    is not a failing one, and ``cron/scheduler_tick.py`` returns 0 BEFORE the due scan -- so jobs
+    keep their due times and nothing fires. Measured 2026-11-24 (kanban t_75dcf7b7): 40
+    consecutive tick cycles refused against ``~/.hermes/profiles/ps5-pm/ESTOP`` while this file
+    printed "✓ Gateway is running — cron jobs will fire automatically". The sentinel therefore
+    OUTRANKS the heartbeat/stale/failing verdicts below and is asked first.
+
+    A torn or unreadable sentinel still counts (``agent/estop.py``'s own fail-safe: the pause is
+    the file's EXISTENCE), and a status surface never fails on its own diagnostic.
+    """
+    try:
+        from agent.estop import engaged_sentinel
+        found = engaged_sentinel()
+    except Exception:
+        return False
+    if found is None:
+        return False
+    path, state = found
+    print(color("⛔ EMERGENCY STOP ENGAGED — cron dispatch is PAUSED: no job will fire", Colors.RED))
+    print(f"  Sentinel: {path}")
+    engaged_at = state.get("engaged_at")
+    age_text = ""
+    if engaged_at:
+        try:
+            age_text = _format_lateness(max(0.0, datetime.now(UTC).timestamp()
+                                            - datetime.fromisoformat(engaged_at).timestamp()))
+        except (TypeError, ValueError):
+            age_text = ""       # a hand-written stamp may be unparseable; the stamp still prints
+        print(f"  Engaged: {engaged_at}" + (f" ({age_text} ago)" if age_text else ""))
+    else:
+        print("  Engaged: at an unstated time (the sentinel body is unreadable — it still pauses)")
+    print(f"  Reason: {state.get('reason') or 'no reason recorded'}")
+    print("  Lift it with: hermes resume")
+    with contextlib.suppress(Exception):
+        from hermes_cli.profiles import get_active_profile_name
+        active = get_active_profile_name()
+        if active:
+            print(f"  This profile only: hermes --profile {active} resume")
+    print(color("  The ticker may still beat and jobs may look merely OVERDUE: the ESTOP gate runs "
+                "before the due scan, so their silence is not evidence about any job.", Colors.DIM))
+    return True
+
+
 def _print_ticker_health(pids: list, restart_command: str = "hermes gateway restart") -> None:
     """Report builtin-ticker liveness for a gateway process known to be alive.
 
     The ticker THREAD can die silently or stay alive while every tick fails, so check both
     the liveness heartbeat and the last-successful-tick marker before saying "will fire".
     """
+    # An ESTOP refuses every tick for a reason that is not the ticker's: say so, and never
+    # report the heartbeat as proof jobs will fire (t_75dcf7b7).
+    if _print_estop_notice():
+        if pids:
+            print(f"  PID: {', '.join(map(str, pids))}")
+        return
     # See #32612, #32895.
     from cron.jobs import (
         get_ticker_heartbeat_age, get_ticker_last_error, get_ticker_success_age)
