@@ -137,6 +137,15 @@ except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
 
+def _loop_silence_s(loop: Any) -> float | None:
+    """How long *loop* has been silent, from the loop watchdog; ``None`` when nothing measures it."""
+    try:
+        from hermes_cli.loop_watchdog import silence_s
+        return silence_s(loop)
+    except Exception:  # a diagnostic must never break the transport
+        return None
+
+
 class WSTransport:
     """Per-connection WS transport. ``write`` is safe from any thread *other than* the loop thread owning the
     socket (pool workers marshal onto the loop and block on the future); from the loop thread itself it would
@@ -207,10 +216,24 @@ class WSTransport:
             fut.result(timeout=_WS_WRITE_TIMEOUT_S)
             return not self._closed
         except concurrent.futures.TimeoutError:  # builtin TimeoutError on 3.11+
-            # The loop is stalled (GIL-heavy turn, delegation), NOT the socket dead: the send is already
-            # scheduled and flushes once the loop breathes. Latching _closed here permanently silenced
-            # live windows after one slow write; _safe_send_many latches on a real error.
-            _log.warning("ws write slow (loop stalled >%ss) peer=%s — frame left in flight", _WS_WRITE_TIMEOUT_S, self._peer)
+            # A blocked write is NOT by itself proof of a loop stall, and this line used to claim one:
+            # the send is scheduled on the loop and awaited here, so the same timeout fires when the
+            # loop is healthy but this peer's socket is not draining (`_safe_send_many` holds the
+            # connection's `_send_lock` across `send_text`, so one parked frame queues every later one).
+            # Ask the loop watchdog how long the loop has been silent and say which it was: 130 such
+            # lines a day read as "loop stalled" made the gateway look blind far more often than it
+            # is, and hid the real stalls — the ones that starve worker receipts.
+            silence = _loop_silence_s(self._loop)
+            if silence is not None and silence < _WS_WRITE_TIMEOUT_S:
+                _log.warning(
+                    "ws write slow (not a loop stall: loop ticked %.1fs ago, peer/send-lock backpressure) "
+                    "peer=%s — frame left in flight", silence, self._peer)
+            else:
+                _log.warning(
+                    "ws write slow (loop stalled >%ss%s) peer=%s — frame left in flight",
+                    _WS_WRITE_TIMEOUT_S,
+                    f", loop silent {silence:.1f}s" if silence is not None else " (unmeasured)",
+                    self._peer)
             return not self._closed
         except Exception as exc:
             self._closed = True

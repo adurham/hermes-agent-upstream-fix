@@ -42,6 +42,11 @@ DEFAULT_STACK_DUMP_AFTER_S = 8.0
 #: Bounded: a stall storm must not grow the process's heap to record itself.
 MAX_RECORDED_STALLS = 200
 
+#: How often the peak drift is logged even when nothing crossed the stall threshold. The acceptance
+#: question "did the loop ever go quiet for more than 2 s" has no line of its own otherwise: a loop
+#: that only ever drifted 1.9 s logs nothing at all.
+DEFAULT_SUMMARY_EVERY_S = 1800.0
+
 
 class GcActivity:
     """Track collections via ``gc.callbacks`` so a stall can name the one in flight.
@@ -120,6 +125,7 @@ class LoopWatchdog:
         stack_dump_after_s: Optional[float] = DEFAULT_STACK_DUMP_AFTER_S,
         log: Optional[logging.Logger] = None,
         dump_path: Optional[str] = None,
+        summary_every_s: Optional[float] = DEFAULT_SUMMARY_EVERY_S,
     ) -> None:
         self._loop = loop
         self._name = name
@@ -128,12 +134,19 @@ class LoopWatchdog:
         self._stack_after = stack_dump_after_s
         self._log = log or _log
         self._dump_path = dump_path
+        self._summary_every = summary_every_s
         self._gc = GcActivity()
         self._stalls: list[dict[str, Any]] = []
         self._handle: Optional[asyncio.TimerHandle] = None
         self._dump_file: Any = None
         self._started = False
         self._armed_dump = False
+        # Read from OTHER threads (a pool thread asking "was this loop alive?") as well as the loop
+        # thread, so these are plain monotonically-updated attributes: no lock, no allocation.
+        self._last_tick_at: Optional[float] = None
+        self._peak_drift_s = 0.0
+        self._last_summary_at: Optional[float] = None
+        self._stalls_since_summary = 0
 
     # -- lifecycle ---------------------------------------------------------------
     def start(self) -> LoopWatchdog:
@@ -142,6 +155,8 @@ class LoopWatchdog:
         self._started = True
         self._gc.install()
         now = self._loop.time()
+        self._last_tick_at = time.monotonic()
+        self._last_summary_at = self._last_tick_at
         self._handle = self._loop.call_later(self._interval, self._tick, now + self._interval)
         self._log.info(
             "loop watchdog armed%s: tick=%.1fs stall_threshold=%.1fs stack_dump=%s",
@@ -162,19 +177,57 @@ class LoopWatchdog:
         """Recorded stalls, oldest first (bounded)."""
         return list(self._stalls)
 
+    # -- read from any thread ----------------------------------------------------
+    def silence_s(self) -> Optional[float]:
+        """Seconds since the loop last completed a tick — the loop's own answer to "are you alive?".
+
+        Called from a pool thread that suspects the loop stopped serving it: a healthy loop keeps
+        this under ``interval_s`` plus its drift, while a loop blinded by a 10 s call reports >10 s.
+        ``None`` when the watchdog is not running (nothing measured: say so rather than guess).
+        """
+        last = self._last_tick_at
+        if not self._started or last is None:
+            return None
+        return max(0.0, time.monotonic() - last)
+
+    @property
+    def peak_drift_s(self) -> float:
+        """Worst tick drift seen since start: the "never exceeded 2 s" number, with no log needed."""
+        return self._peak_drift_s
+
     # -- heartbeat ---------------------------------------------------------------
     def _tick(self, expected: float) -> None:
         if not self._started:
             return
         now = self._loop.time()
         drift = now - expected
+        self._last_tick_at = time.monotonic()
+        self._peak_drift_s = max(self._peak_drift_s, drift)
         if drift >= self._threshold:
+            self._stalls_since_summary += 1
             self._report(drift)
+        self._maybe_summarise(drift)
         # Re-arm the C-level dump: if this loop never reaches the next tick, faulthandler's own
         # timer fires from its C thread and the stacks are captured WHILE whatever holds the GIL
         # still holds it. Cancelling first keeps exactly one timer in flight.
         self._arm_stack_dump()
         self._handle = self._loop.call_later(self._interval, self._tick, now + self._interval)
+
+    def _maybe_summarise(self, drift: float) -> None:
+        """Log the peak drift periodically, so "the loop never drifted past 2 s" is a line, not a silence."""
+        last_summary = self._last_summary_at
+        if not self._summary_every or last_summary is None or self._last_tick_at is None:
+            return
+        window = self._last_tick_at - last_summary
+        if window < self._summary_every:
+            return
+        self._log.info(
+            "loop lag summary%s: peak=%.2fs now=%.2fs stalls>=%.1fs=%d over %.0fs",
+            f" ({self._name})" if self._name else "", self._peak_drift_s, max(0.0, drift),
+            self._threshold, self._stalls_since_summary, window,
+        )
+        self._last_summary_at = self._last_tick_at
+        self._stalls_since_summary = 0
 
     def _arm_stack_dump(self) -> None:
         if not self._stack_after:
@@ -270,6 +323,7 @@ def install(
     stack_dump_after_s: Optional[float] = DEFAULT_STACK_DUMP_AFTER_S,
     log: Optional[logging.Logger] = None,
     dump_path: Optional[str] = None,
+    summary_every_s: Optional[float] = DEFAULT_SUMMARY_EVERY_S,
 ) -> LoopWatchdog:
     """Install a watchdog on ``loop``. Idempotent per loop: a loop already carrying one keeps it."""
     existing = getattr(loop, "_hermes_loop_watchdog", None)
@@ -278,9 +332,22 @@ def install(
     watchdog = LoopWatchdog(
         loop, name=name, interval_s=interval_s, stall_threshold_s=stall_threshold_s,
         stack_dump_after_s=stack_dump_after_s, log=log, dump_path=dump_path,
+        summary_every_s=summary_every_s,
     ).start()
     try:
         loop._hermes_loop_watchdog = watchdog  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
         pass
     return watchdog
+
+
+def silence_s(loop: Any) -> Optional[float]:
+    """Seconds since *loop* last ran a callback, from the installed watchdog; ``None`` when unmeasured.
+
+    For a worker thread (or any caller off the loop) that needs to know whether a late reply is the
+    loop's fault or its own: this is a measurement, not a guess from the symptom.
+    """
+    watchdog = getattr(loop, "_hermes_loop_watchdog", None)
+    if isinstance(watchdog, LoopWatchdog):
+        return watchdog.silence_s()
+    return None
