@@ -16,8 +16,9 @@ def cmd_pause(args: argparse.Namespace) -> int:
     from agent.estop import engage, get_state, is_engaged
 
     reason = getattr(args, "reason", None)
+    restart_token = getattr(args, "restart_token", None)
     already = is_engaged()
-    path = engage(reason=reason)
+    path = engage(reason=reason, restart_token=restart_token)
     state = get_state() or {}
     verb = "Still paused" if already else "Hermes paused"
     detail = f" — reason: {state['reason']}" if state.get("reason") else ""
@@ -27,13 +28,28 @@ def cmd_pause(args: argparse.Namespace) -> int:
         "    Cron dispatch, kanban dispatch, and new gateway turns (messaging and interactive\n"
         "    CLI, TUI and Desktop turns alike) are on hold. In-flight work keeps running.\n"
         "    Run `hermes resume` to lift the pause.")
+    if restart_token:
+        print(
+            f"    Machine-tagged for a restart ({restart_token}): the gateway boot that completes\n"
+            "    this restart lifts it on its own, so a restart that cannot resume (killed mid-wait)\n"
+            "    leaves no pause behind. An untagged `hermes pause` is never lifted this way.")
     return 0
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
     """Disengage the global emergency stop."""
-    from agent.estop import disengage, sentinel_path
+    from agent.estop import disengage, release_restart, sentinel_path
 
+    restart_token = getattr(args, "restart_token", None)
+    if restart_token:
+        # Narrow resume: a restart lifts only the sentinel it wrote. An operator's pause (no
+        # token, or a token that is not this one) is left engaged.
+        lifted = release_restart(restart_token)
+        if lifted:
+            print(f"▶️  Hermes resumed — the restart's own sentinel is gone ({lifted}).")
+        else:
+            print(f"No sentinel carries the restart token {restart_token!r} — nothing to lift.")
+        return 0
     if disengage():
         print("▶️  Hermes resumed — dispatch picks up on the next tick.")
     else:
@@ -52,9 +68,19 @@ def build_pause_parser(subparsers) -> None:
             "running finish; in-flight work is never killed.")
     pause_parser.add_argument(
         "--reason", default=None, help="Optional reason stored in the sentinel and shown to users")
+    pause_parser.add_argument(
+        "--restart-token", default=None, metavar="TOKEN",
+        help="Tag this pause as written BY a restart: the gateway boot that completes the restart "
+             "lifts it automatically (a pause that would otherwise outlive its restart when the "
+             "restarting script is killed mid-wait). Omit for an operator pause — an untagged "
+             "sentinel is only ever lifted by `hermes resume`.")
     pause_parser.set_defaults(func=cmd_pause)
 
     resume_parser = subparsers.add_parser(
         "resume", help="Lift the emergency stop set by `hermes pause`",
         description="Remove the ESTOP sentinel; dispatch resumes on the next tick.")
+    resume_parser.add_argument(
+        "--restart-token", default=None, metavar="TOKEN",
+        help="Lift ONLY the sentinel carrying this restart token (a restart cleaning up after "
+             "itself); an operator's pause is left engaged.")
     resume_parser.set_defaults(func=cmd_resume)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
@@ -260,3 +261,36 @@ class GatewayRuntimeInitMixin:
         self._scale_to_zero_cooldown_until: float = 0.0
         self._scale_to_zero_no_suspend_logged: bool = False
         self._scale_to_zero_direct_platform_logged: bool = False
+
+
+def boot_lift_restart_estop(*, boot_started_at: Optional[float] = None) -> list:
+    """THE boot seat: lift the ESTOP a restart wrote — and only that one (t_34b5acc6).
+
+    Called by ``gateway.run_bootstrap._start_gateway_runtime`` immediately after this process has
+    claimed the gateway pid file: the moment at which "this process is the gateway for this home"
+    is proven rather than assumed. Constructing a ``GatewayRunner`` is NOT that proof — the test
+    suite, the desktop's web server and ad-hoc callers construct one too, and a clear from that
+    path could lift a restart pause another process is still draining.
+
+    ``hermes_safe_restart.sh`` pauses new work, drains, restarts the unit, then resumes; a restart
+    that SIGKILLs the script leaves the pause standing (measured 40 min past the boot it belonged
+    to, t_d4e7d48c — six frozen clocks, a refused deploy gate, 13 interrupted admissions). This
+    boot IS the completion of that pause, so it lifts the sentinel under ``agent.estop``'s narrow
+    rule: a body that parses, a ``restart_token``, and an ``engaged_at`` older than
+    ``boot_started_at``. An operator's ``hermes pause`` (no token), a torn/empty body and a
+    sentinel written after this boot all stand; the read surfaces (``cron status``, the lane's
+    crew line, the pager) keep naming whichever one does.
+    """
+    from agent import estop
+    try:
+        cleared = estop.clear_completed_restart(boot_started_at=boot_started_at)
+    except Exception:
+        logger.warning("boot: could not lift a restart's ESTOP sentinel", exc_info=True)
+        return []
+    for record in cleared:
+        logger.warning(
+            "boot: lifted the ESTOP a restart wrote (token %s, engaged %s, reason: %s) — %s",
+            record["restart_token"], record["engaged_at"], record["reason"] or "none",
+            record["path"],
+        )
+    return cleared

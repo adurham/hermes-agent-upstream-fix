@@ -773,7 +773,10 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all; ``idle_exit`` arms the
-    unmanaged idle exit (``gateway.run_idle_exit``) for a client-started daemon."""
+    unmanaged idle exit (``gateway.run_idle_exit``) for a client-started daemon)."""
+    # The clock a restart-tagged ESTOP must precede to be ours to lift (t_34b5acc6): captured
+    # before any claim/wait so a sentinel written later in this boot belongs to a later restart.
+    _boot_started_at = time.time()
     from gateway.run import (
         GatewayRunner,
         _best_effort,
@@ -845,6 +848,13 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     if not _start_gateway_claim_pid_file(force=force):
         release_gateway_runtime_lock()
         return False
+
+    # This process is THE gateway for this home now (the claim above is the proof), so the restart
+    # a tagged ESTOP was written for ends here: lift exactly that sentinel before any dispatch
+    # decision (t_34b5acc6). Never from GatewayRunner construction — the test suite builds runners
+    # too, and a clear there could lift a restart pause another process is still draining.
+    from gateway.run_runtime_init import boot_lift_restart_estop
+    boot_lift_restart_estop(boot_started_at=_boot_started_at)
 
     _control_server = None
     runner = None
