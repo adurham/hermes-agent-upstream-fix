@@ -173,6 +173,15 @@ class ManagedWorker:
         # The gateway restart/shutdown reason when that stop (not a user's) signalled this worker.
         self.stop_cause = None
         self.writer = threading.Thread(target=self._write_controls, name='managed-control-writer', daemon=True)
+        # The writer exists only to deliver a control frame AFTER the bootstrap frame has gone down
+        # this same stdin pipe -- order is the point, a Stop must never reach a child that has not
+        # been bootstrapped. Starting it with the worker instead cost a wake-every-0.5 s thread for
+        # the whole life of every worker, and most workers are never controlled at all: 15 live
+        # workers held 15 of these threads in a gateway already at 233 threads, where the GIL cost
+        # of scheduling them is what starves the loop. So it is armed at the bootstrap boundary and
+        # started by the first control frame queued after that.
+        self._writer_lock = threading.Lock()
+        self._writer_armed = False
         # One dedicated reader thread per worker (never the loop's shared default executor, which
         # parked pipe reads would exhaust). It reads one frame per demand, so the pipe keeps its
         # backpressure, and posts it here; a cancelled next_frame leaves the frame for the next.
@@ -195,6 +204,23 @@ class ManagedWorker:
                 self.send(frame)
         except (OSError, ValueError):
             self.closed.set()
+
+    def arm_writer(self):
+        """The bootstrap frame is down the pipe: controls may reach stdin now.
+
+        Starts the writer if a Stop was already queued while the child was still being
+        bootstrapped (the frame waits in ``self.commands`` until here, so it cannot overtake the
+        bootstrap); otherwise the writer stays dormant until the first later control frame.
+        """
+        self._writer_armed = True
+        if not self.commands.empty():
+            self._start_writer()
+
+    def _start_writer(self):
+        with self._writer_lock:
+            if self.writer.ident is not None or self.closed.is_set():
+                return
+            self.writer.start()
 
     def _read_frames(self, loop):
         """Reader thread body. It owns ``stdout``: no other thread closes it under a blocked read."""
@@ -258,6 +284,8 @@ class ManagedWorker:
             self.commands.put_nowait(frame)
         except queue.Full as exc:
             raise AuthorityRefusal('worker_control_backpressure') from exc
+        if self._writer_armed:
+            self._start_writer()
 
     def _stop_budget(self, ack):
         """Seconds left of the ``ack`` window that opened at the first Stop. Pure: only
@@ -736,7 +764,7 @@ async def execute_managed(authority, ref, row, policy):
         frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
         await asyncio.to_thread(worker.send, frame)
-        worker.writer.start()
+        worker.arm_writer()
         while True:
             frame = await worker.next_frame(None, ack=STOP_ACK_SECONDS)
             # The claim's execution stamp, not a ledger read per frame (publish_execution fences the same way).
