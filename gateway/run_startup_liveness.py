@@ -10,6 +10,41 @@ from gateway.shutdown_watchdog import (
 
 logger = logging.getLogger("gateway.run")
 
+_GC_TUNED = False
+
+
+def tune_gc_for_long_lived_process() -> None:
+    """Stop a full collection from owning the GIL for the length of a stall.
+
+    Measured on 2026-11-25: ``event loop stalled 58.3s ... attribution=gc idle; last gen2 58.3s
+    1s ago`` — a gen2 collection was running for the entire stall, and a collection walks the whole
+    live graph with the GIL held, so no callback ran for 58 seconds. Two things make it that slow: the
+    heap is built once at startup and then lives forever (a day-old gateway holds millions of
+    long-lived objects that are never garbage), and 130+ threads compete for the GIL the collection
+    holds, inflating its wall time further.
+
+    ``gc.freeze()`` moves everything alive at startup into the permanent generation, so later
+    collections never traverse it; the raised thresholds make a full collection rare instead of
+    routine. Idempotent, and a no-op on interpreters without ``freeze``.
+    """
+    global _GC_TUNED
+    if _GC_TUNED:
+        return
+    import gc
+
+    try:
+        gc.collect(generation=2)          # settle any startup garbage first
+        freeze = getattr(gc, "freeze", None)
+        if freeze is not None:
+            freeze()                      # ... then make the survivors permanent
+        # Default is (700, 10, 10) = one full collection per ~70k allocations; this is one per ~2M.
+        # Worth setting even without freeze(): fewer full collections is the whole point.
+        gc.set_threshold(5_000, 20, 20)
+    except Exception:
+        logger.debug("Failed to tune garbage collection for the gateway", exc_info=True)
+    _GC_TUNED = True
+
+
 
 def _arm_stall_reporter(self, loop: asyncio.AbstractEventLoop) -> None:
     """Report every loop stall with its duration, an attribution and a mid-stall stack dump.
@@ -45,6 +80,7 @@ def start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
     from gateway.shutdown_watchdog import _arm_loop_floor_timer, start_loop_liveness_watchdog
     from gateway.run import _load_gateway_config
     from hermes_state_loop_guard import install_from_config
+    tune_gc_for_long_lived_process()  # before the guards: a full GC must never look like a hang
     install_from_config(_load_gateway_config())  # gateway.sessiondb_loop_guard (debug, default off)
     _arm_stall_reporter(self, loop)
     config = getattr(self, "config", None)
