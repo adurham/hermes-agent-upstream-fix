@@ -1031,7 +1031,7 @@ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
-hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+hermes kanban schedule <id>... "<reason>"              # park in Scheduled (waiting on time/event)
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
@@ -1094,14 +1094,29 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
-### Scheduled task starts (`scheduled_at`)
+### Scheduled task starts — not implemented (`scheduled_at` does not exist)
 
-Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
+**There is no `scheduled_at`.** No such column exists on `tasks`, no dispatcher path reads it, and
+`hermes kanban create` has no `--scheduled-at` flag — earlier revisions of this page documented both,
+which was wrong. What exists is the `scheduled` **status**: `hermes kanban schedule <id> "<reason>"`
+(or a worker calling `kanban_schedule`) parks a card, ends its run, and makes it non-dispatchable.
+Nothing on the board ever takes it back out — there is no timer — so the only exit is
+`hermes kanban unblock <id>` (which re-gates on parents: `todo` while one is open, `ready` when all
+are terminal).
 
-```bash
-hermes kanban create "nightly backup audit" \
-  --assignee ops --scheduled-at "2026-06-01T03:00:00Z"
+A deployment that needs timed/event wakes runs a guard over the parked cards. The ps5 lane runs
+`~/.hermes/profiles/ps5-pm/scripts/scheduled_wake.py` every 15 min (`no_agent` cron): it reads a
+wake marker out of the card's newest run/`scheduled`/`blocked` reason and promotes the card when the
+condition holds, and leaves marker-less cards alone.
+
 ```
+SCHEDULED_UNTIL=<ISO8601>    wake at that instant (`Z` and ±HH:MM offsets; naive = local)
+WAKE_WHEN=<absolute path>    wake when that path exists
+```
+
+Both markers on one card must hold. The guard writes `state/scheduled_wake.status.json`
+(`promoted` / `skipped` / `markerless`) so every move it made is auditable, and `--dry-run` prints
+the same list without writing anything.
 
 ### Respawn guard
 
