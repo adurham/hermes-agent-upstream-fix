@@ -42,19 +42,36 @@ def note_held(now: Optional[float] = None) -> None:
     if str(cron_dir) not in _hold_since:
         held = read(cron_dir)
         # Another process's hold still being stamped continues; anything older starts a new hold.
+        # A marker that already carries `resumed` is an ENDED hold: its `since` is history, and a
+        # new hold must not inherit it just because the resume was seconds ago.
         since = now
-        if held and now - held["last"] <= 2 * TICK_SLACK_SECONDS:
+        if held and held["resumed"] is None and now - held["last"] <= 2 * TICK_SLACK_SECONDS:
             since = held["since"]
         _hold_since[str(cron_dir)] = since
     with contextlib.suppress(OSError):  # an unwritable store is reported by the tick itself
         atomic_json_write(Path(cron_dir) / _FILE, {"since": _hold_since[str(cron_dir)], "last": now})
 
 
-def note_dispatching() -> None:
-    """The ticker dispatches the active cron store again: this process's hold on it has ended."""
-    from cron.jobs import _current_cron_store
+def note_dispatching(now: Optional[float] = None) -> None:
+    """The ticker dispatches the active cron store again: this process's hold on it has ended.
 
-    _hold_since.pop(str(_current_cron_store().cron_dir), None)
+    The marker is a LIVE state, not a tombstone: ``since``/``last`` alone never said a hold had
+    ENDED, so a resumed one was indistinguishable from a stuck one (measured above). Stamp
+    ``resumed`` on the first dispatching tick -- once, so the stamp keeps naming WHEN dispatch
+    came back instead of sliding forward with every later tick.
+    """
+    from cron.jobs import _current_cron_store
+    from utils import atomic_json_write
+
+    cron_dir = Path(_current_cron_store().cron_dir)
+    _hold_since.pop(str(cron_dir), None)
+    held = read(cron_dir)
+    if not held or held["resumed"] is not None:
+        return
+    now = time.time() if now is None else now
+    with contextlib.suppress(OSError):  # an unwritable store is reported by the tick itself
+        atomic_json_write(cron_dir / _FILE,
+                          {"since": held["since"], "last": held["last"], "resumed": now})
 
 
 def note_held_profiles(profiles) -> None:
@@ -69,9 +86,28 @@ def note_held_profiles(profiles) -> None:
 def read(cron_dir: Path) -> Optional[dict]:
     try:
         data = json.loads((Path(cron_dir) / _FILE).read_text(encoding="utf-8-sig"))
-        return {"since": float(data["since"]), "last": float(data["last"])}
-    except (OSError, ValueError, TypeError, KeyError):
+        resumed = data.get("resumed")
+        return {"since": float(data["since"]), "last": float(data["last"]),
+                "resumed": None if resumed is None else float(resumed)}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
+
+
+def hold_active(cron_dir: Path, now: Optional[float] = None) -> bool:
+    """True while a drain is STILL holding dispatch for *cron_dir*.
+
+    Ask this rather than inferring a hold from the marker's presence or the age of ``last``: the
+    file crosses the restart it describes, so presence alone proves nothing, and only a tick that
+    keeps refreshing ``last`` proves the hold never ended. Measured 2026-11-24 on the ps5 lane: a
+    marker frozen at ``{since: 21:44:52, last: 21:44:52}`` for 34 minutes, while the ticker
+    heartbeated every minute and every ps5-pm job fired on its normal interval, reddened six pins
+    and one cut.
+    """
+    held = read(cron_dir)
+    if not held or held["resumed"] is not None:
+        return False
+    now = time.time() if now is None else now
+    return now - held["last"] <= 2 * TICK_SLACK_SECONDS
 
 
 def grace_starts_at(cron_dir: Path, due_at: float, grace: float) -> float:
