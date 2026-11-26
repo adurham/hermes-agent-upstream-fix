@@ -36,23 +36,38 @@ from hermes_cli._startup_fast import project_root_str
 
 logger = logging.getLogger("gateway.run")
 
-# Profiles that may never restart the host gateway, on top of the ``-pm`` suffix rule below.
-# A lane PM is a lane's OWN unattended agent: it commits to the checkout, it runs while nobody is
-# home, and when its restart's drain bound expires it force-stops every other lane's in-flight
-# work. Measured 2026-11-25: a ps5-pm agent committed at 18:29:11, requested a gateway restart ten
-# seconds later, and the 1800 s bound stopped 12 managed workers at 18:59 with the owner away.
-# Restarting the host is the owner's call -- `hermes gateway restart`, `hermes update`, or /restart
-# from the owner's own chat -- never a lane's.
-RESTART_DENIED_PROFILE_SUFFIX = "-pm"
+# Profiles allowed to restart the host gateway. ``default`` is always allowed (it is the owner's
+# own bot); everything else must be named explicitly. This is an ALLOWLIST on purpose: a lane is
+# one of the owner's unattended agents, it runs while nobody is home, and when its restart's drain
+# bound expires it force-stops every other lane's in-flight work. Measured 2026-11-25: a ps5-pm
+# agent committed at 18:29:11, requested a gateway restart ten seconds later, and the 1800 s bound
+# stopped 12 managed workers at 18:59 with the owner away. A naming convention is not an identity:
+# a renamed or newly added lane must be denied by default, not by failing to end in "-pm".
+#   gateway:
+#     restart_allowed_profiles: [default, my-owner-chat]
+RESTART_ALWAYS_ALLOWED_PROFILE = "default"
+
+
+def restart_allowed_profiles() -> frozenset:
+    """Profiles that may restart the host gateway: ``default`` plus ``gateway.restart_allowed_profiles``."""
+    allowed = {RESTART_ALWAYS_ALLOWED_PROFILE}
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import cfg_get
+        raw = cfg_get("gateway.restart_allowed_profiles", None)
+        if isinstance(raw, (list, tuple, set)):
+            allowed.update(str(p).strip() for p in raw if str(p).strip())
+    return frozenset(allowed)
 
 
 def gateway_restart_denied_profile(source: object) -> Optional[str]:
-    """The lane profile that may not restart this gateway, or ``None`` when the caller may.
+    """The profile that may not restart this gateway, or ``None`` when the caller may.
 
     Read from the identity pinned at ingress (``profile_routes`` re-homes an event to the profile
-    that executes it), falling back to ``source.profile``. Fails OPEN on an unresolved profile: the
-    transports that can reach a slash command without one are the owner's own, and a denial that
-    cannot name a profile would block the host's chat too.
+    that executes it), falling back to ``source.profile``. Only an allowlisted profile may restart.
+    Fails OPEN when no profile resolves at all: the transports that can reach a slash command
+    without one are the owner's own, and a denial that cannot name a profile would block the host's
+    own chat. (A lane cannot reach this code by omitting the profile: it does not craft slash
+    commands, it shells out, which is the CLI path.)
     """
     profile = None
     with contextlib.suppress(Exception):
@@ -65,9 +80,7 @@ def gateway_restart_denied_profile(source: object) -> Optional[str]:
     if not isinstance(profile, str) or not profile.strip():
         return None
     name = profile.strip()
-    if name.lower().endswith(RESTART_DENIED_PROFILE_SUFFIX):
-        return name
-    return None
+    return None if name in restart_allowed_profiles() else name
 
 
 def _refused_lane_restart(profile: str, command: str) -> str:

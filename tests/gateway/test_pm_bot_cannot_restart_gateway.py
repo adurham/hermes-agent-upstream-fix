@@ -41,8 +41,24 @@ def make_restart_source_with(profile):
 
 
 @pytest.mark.parametrize("profile", ["default", "work", "ops"])
-def test_the_owners_own_profiles_are_not_denied(profile):
+def test_the_owners_own_profiles_are_not_denied(profile, monkeypatch):
+    """The allowlist defaults to `default` alone; a named owner profile may be added in config."""
+    from gateway import slash_commands
+    monkeypatch.setattr(slash_commands, "restart_allowed_profiles",
+                        lambda: frozenset({"default", "work", "ops"}))
     assert gateway_restart_denied_profile(make_restart_source_with(profile)) is None
+
+
+def test_a_profile_nobody_allowlisted_is_denied_even_without_a_pm_suffix(monkeypatch):
+    """A renamed or newly added lane must be denied by default, not by its name."""
+    from gateway import slash_commands
+    monkeypatch.setattr(slash_commands, "restart_allowed_profiles", lambda: frozenset({"default"}))
+    assert gateway_restart_denied_profile(make_restart_source_with("newlane")) == "newlane"
+
+
+def test_default_is_always_allowed_even_when_config_is_silent():
+    from gateway.slash_commands import restart_allowed_profiles
+    assert "default" in restart_allowed_profiles()
 
 
 def test_an_unresolved_profile_fails_open():
