@@ -9,6 +9,44 @@ is a pending upstream contribution — divergence is permanent and is managed lo
 what the fork carries is `docs/fork-inventory-2026-11-05.md`; the boundary table further down is
 computed from the tree, not maintained by hand.
 
+### Fork-only fix — 2026-11-25 (kanban): the loss record threw away the worker's wait status, and our own teardown was booked as a crash
+
+**Symptom.** 81 managed-worker losses in one day read `managed worker lost: EOFError`, 80 with no
+cause at all. `EOFError` is the *class name of the owner's frame-pipe exception*, not a cause, so a
+census of the defect was guesswork: the 11:16:08 burst (three worker EOFs in 6 ms, two
+`ps5-resident-guard-*` units dying `status=9/KILL` in the same second, no `Stopping` line, no kernel
+OOM) stayed unnamed while the owner held the answer at that exact instant.
+
+**Root cause.** (1) `record_worker_loss` built `{reason, claim_lock, run_id, pid, bound}` + cgroup
+`memory` + `planned_restart` + `owner`, and never stored the child's `returncode` — the one field
+that separates SIGKILL (`-9`) from exit 0 from the owner's own SIGTERM (`-15`). (2)
+`ManagedWorker.close()` set `closed` and released the reader's demand but never latched `stop`;
+`next_frame` only converts a teardown into `AuthorityRefusal('managed_worker_stopped')` through that
+latch, and `_record_lost_attempt` skips only that exact reason, so a bare `close()` (the
+cancelled-spawn path in `session_worker_spawn.acquire_process`) surfaced as `EOFError` and was booked
+as a crashed card.
+
+**Fix.** `record_worker_loss(..., exit_status=, owner_closed=, memory=)`: the wait status and the
+teardown latch ride in the `worker_lost` payload, and `memory` may be passed pre-captured because
+reading the wait status reaps the child (which takes `/proc/<pid>/cgroup` — how the owner finds its
+scope — with it), so `_record_lost_attempt` reads the cgroup counters FIRST and only then asks
+`ManagedWorker.loss_state()` (bounded 2 s wait; `None` = still running). `loss_evidence()` renders
+`[oom_kill=0; cgroup peak 1.86 GiB of 6.00 GiB cap; exit=SIGKILL(9); owner_closed=False]`.
+`ManagedWorker.close()` latches the Stop (thread-safely — `call_soon_threadsafe` to the awaiting
+loop — since close runs on a worker thread) and `next_frame` prefers `closed` over the reader's EOF,
+so our own teardown books `managed_worker_stopped` (no loss note at all) instead of a crash.
+
+**Files.** `gateway/session_kanban.py`, `gateway/session_managed_worker.py`,
+`hermes_cli/kanban_owner_recovery.py`; tests `tests/gateway/test_managed_worker_close_is_a_stop.py`
+(new) and `tests/hermes_cli/test_kanban_managed_worker_loss.py` (+5).
+
+**Evidence.** 29 + 18 + 36 tests pass across the new file, the loss/booking file and every managed
+worker / owner-recovery suite that touches the changed modules, with real children: a SIGKILLed child
+records `exit_status=-9` through the real handler onto a real board row, a `close()`d worker reads
+`managed_worker_stopped` and writes no `worker_lost` event, and an EOF nobody closed still raises
+`EOFError`. **Deploy.** Needs a new owner generation (`hermes-desktop-serve.service`) — the code is
+inert until the service restarts with no managed worker in flight.
+
 ### Fork-only fix — 2026-11-23 (auxiliary timeouts): a connect/TLS stall consumed the whole generation budget
 
 **Symptom.** `ps5-pm` logged `Auxiliary consult: using ollama-cloud-team (kimi-k3.1-pro)` at 15:21:47 and did not

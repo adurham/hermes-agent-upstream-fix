@@ -364,7 +364,13 @@ def _planned_restart_evidence():
     return {'requested_at': requested_at, 'age_s': int(age)}
 
 
-def record_worker_loss(policy, reason, *, pid=None, bound=False, owner=None):
+#: Distinguishes "the caller did not observe it" from "observed as nothing" in a loss record:
+#: an absent wait status is not the same fact as exit 0, and a census must not merge them.
+_UNOBSERVED = object()
+
+
+def record_worker_loss(policy, reason, *, pid=None, bound=False, owner=None,
+                       exit_status=_UNOBSERVED, owner_closed=None, memory=_UNOBSERVED):
     """Append a run-scoped ``worker_lost`` event for this attempt to the card's board.
 
     Dropped when the card has moved past the run (it says nothing about the current attempt).
@@ -374,6 +380,14 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False, owner=None):
     cgroup counters (``memory``) and the planned-restart marker (``planned_restart``), plus any
     ``owner`` state the caller passes (``draining`` / ``restart_requested``) — so that
     ``owner_attempt_note`` can say WHY the pipe closed instead of naming only ``EOFError``.
+
+    ``exit_status`` is the child's wait status (negative = killed by that signal, ``0`` = clean
+    exit) and ``owner_closed`` whether the owner itself had closed/stopped the worker; both are
+    held only HERE, at the moment of loss, and they are what tells a real crash from our own
+    teardown and from a signal no other record names (2026-11-25: 81 losses, 80 with no cause
+    at all, and the burst that killed two sibling units ``status=9/KILL`` unnamed). ``memory``
+    may be passed pre-captured: the caller has to reap the child to read its wait status, and
+    the cgroup counters must be read BEFORE that reap (``/proc/<pid>/cgroup`` goes with it).
     """
     try:
         context = json.loads(policy.kanban_json or 'null')
@@ -384,7 +398,12 @@ def record_worker_loss(policy, reason, *, pid=None, bound=False, owner=None):
         run_id = int(context['run_id'])
         evidence = {'reason': str(reason)[:200], 'claim_lock': context['claim_lock'],
                     'run_id': run_id, 'pid': pid, 'bound': bool(bound)}
-        memory = _loss_memory(pid)
+        if exit_status is not _UNOBSERVED:
+            evidence['exit_status'] = (exit_status if isinstance(exit_status, int)
+                                       and not isinstance(exit_status, bool) else None)
+        if owner_closed is not None:
+            evidence['owner_closed'] = bool(owner_closed)
+        memory = _loss_memory(pid) if memory is _UNOBSERVED else memory
         if memory:
             evidence['memory'] = memory
         restart = _planned_restart_evidence()

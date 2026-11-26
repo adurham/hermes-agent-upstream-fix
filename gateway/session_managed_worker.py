@@ -27,6 +27,10 @@ STOP_ACK_SECONDS = 30
 # How long a lost attempt's board note may hold up settling its admission (the note is
 # advisory; a busy board's write finishes in the background).
 LOSS_RECORD_WAIT_S = 10
+# How long the loss record waits for the child to become reapable so it can name a signal.
+# The wait is off-loop and runs before close(); a child that outlives it is recorded as
+# ``exit=running``, never waited on further.
+LOSS_STATUS_WAIT_S = 2.0
 # Own session (POSIX): a worker whose owner died kills its whole group (managed_worker
 # _die_with_owner); on Windows it exits itself.
 # detached-spawn: ok — covered: the worker kills its own group when its owner dies (_die_with_owner)
@@ -172,6 +176,9 @@ class ManagedWorker:
         self.stopped_at = None
         # The gateway restart/shutdown reason when that stop (not a user's) signalled this worker.
         self.stop_cause = None
+        # The loop an awaiting next_frame belongs to (recorded there): close() runs on a worker
+        # thread and must latch the Stop through it.
+        self._loop = None
         self.writer = threading.Thread(target=self._write_controls, name='managed-control-writer', daemon=True)
         # The writer exists only to deliver a control frame AFTER the bootstrap frame has gone down
         # this same stdin pipe -- order is the point, a Stop must never reach a child that has not
@@ -289,14 +296,23 @@ class ManagedWorker:
 
     def _stop_budget(self, ack):
         """Seconds left of the ``ack`` window that opened at the first Stop. Pure: only
-        ``control`` stamps ``stopped_at``, so a read before any Stop (the hello) never starts
-        the window a later Stop must receive in full."""
+        ``control``/``_latch_stop`` stamp ``stopped_at``, so a read before any Stop (the hello)
+        never starts the window a later Stop must receive in full. A latch with no stamp (a
+        worker closed before it ever awaited a frame) has no budget left to grant."""
+        if self.stopped_at is None:
+            return 0.0
         return self.stopped_at + ack - time.monotonic()
 
     async def next_frame(self, timeout, ack):
         """Read one frame. A requested Stop bounds supervision to ``ack`` seconds TOTAL from the
         first Stop: a child that keeps emitting valid frames is escalated on the same deadline as a
-        silent one, instead of leaving the turn started behind it."""
+        silent one, instead of leaving the turn started behind it.
+
+        A ``close()`` is a Stop too: it latches one and closes the pipe, so its EOF must read as
+        ``managed_worker_stopped`` (our own teardown) instead of as a lost worker, and a frame
+        exception queued by the reader after the latch is read the same way.
+        """
+        self._loop = asyncio.get_running_loop()
         if self.reader is None:
             self._arrived = asyncio.Event()
             from agent.memory_provider import spawn_context_thread
@@ -311,16 +327,25 @@ class ManagedWorker:
         try:
             if not self._frames and not self.stop.is_set():
                 await asyncio.wait({arrived, stopper}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                if not self._frames and self.closed.is_set():
+                    raise AuthorityRefusal('managed_worker_stopped')
                 if not self._frames and not self.stop.is_set():
                     raise AuthorityRefusal('managed_worker_hello_timeout')
             if not self._frames:
                 # Only a latched Stop gets here; its window runs from the first Stop.
+                if self.closed.is_set():
+                    raise AuthorityRefusal('managed_worker_stopped')
                 remaining = self._stop_budget(ack)
                 if remaining > 0:
                     await asyncio.wait({arrived}, timeout=remaining)
             if not self._frames:
                 raise AuthorityRefusal('managed_worker_stopped')
-            return self._take()
+            try:
+                return self._take()
+            except (EOFError, ValueError, OSError, RecursionError) as exc:
+                if self.closed.is_set():
+                    raise AuthorityRefusal('managed_worker_stopped') from exc
+                raise
         finally:
             stopper.cancel()
             arrived.cancel()
@@ -364,8 +389,60 @@ class ManagedWorker:
                 pass
         (self.process.kill if kill else self.process.terminate)()
 
+    def _latch_stop(self):
+        """Latch a Stop from ANY thread — ``close()`` runs on a worker thread.
+
+        ``self.stop`` is an asyncio.Event, and only its own loop may wake its waiters: setting
+        it from another thread can leave the owner parked in ``select`` (``call_soon`` from a
+        foreign thread does not write the loop's self-pipe), i.e. the very wedge this teardown
+        must never create. The awaiting loop is asked to do it; with no ``next_frame`` ever
+        awaited there is no waiter and the set is direct.
+        """
+        if self.stopped_at is None:
+            self.stopped_at = time.monotonic()
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            self.stop.set()
+            return
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            self.stop.set()
+            return
+        try:
+            loop.call_soon_threadsafe(self.stop.set)
+        except RuntimeError:
+            self.stop.set()
+
+    def loss_state(self, wait=LOSS_STATUS_WAIT_S):
+        """The child's wait status and our own teardown latch, for the board's loss record.
+
+        ``returncode`` is the one fact that separates a SIGKILL (``-9``) from a clean exit
+        (``0``) and from our own SIGTERM (``-15``), and the owner holds it only at the instant
+        it takes the loss. Reading it REAPS the child, so the caller must capture the cgroup
+        counters first: ``/proc/<pid>/cgroup`` — the way the owner finds the worker's scope —
+        goes with the reap. A child that outlives ``wait`` is reported as ``None`` (still
+        running) rather than waited on; ``close()`` escalates it.
+        """
+        status = None
+        try:
+            status = self.process.poll()
+            if status is None:
+                with suppress(subprocess.TimeoutExpired):
+                    status = self.process.wait(timeout=wait)
+        except (OSError, ValueError):
+            status = None
+        return {'exit_status': status,
+                'owner_closed': self.closed.is_set() or self.stop.is_set()}
+
     def close(self):
         self.closed.set()
+        # Our own teardown is a Stop: without the latch next_frame reads the pipe close as
+        # EOFError and the loss is booked as a crash (2026-11-25: the cancelled-spawn path
+        # called close() and the card paid for it).
+        self._latch_stop()
         self._demand.release()  # a reader parked between frames exits; one mid-read ends at EOF
         if self.process.poll() is None:
             self._signal_worker(kill=False)
@@ -590,17 +667,21 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
-def _record_lost_attempt(authority, policy, exc, reason, scope):
+def _record_lost_attempt(authority, policy, exc, reason, scope, worker=None):
     """Start the board disposition (``worker_lost``) for a lost Kanban card attempt; the task, or None.
 
     A worker that dies in ``worker.adopt`` never writes ``worker_bound``/``worker_result``, so
     without it the card's run learns nothing from its own loss. A deliberate Stop or a
     superseded generation is not a loss. Tracked, so retirement joins the write.
+
+    ``worker`` (the child, when it still exists) contributes the two facts only the owner can
+    read at this instant: the child's wait status — SIGKILL vs exit 0 vs our own SIGTERM — and
+    whether the owner itself had closed/stopped it.
     """
     if (not getattr(policy, 'kanban_json', None) or isinstance(exc, asyncio.CancelledError)
             or reason in ('managed_worker_stopped', 'stale_generation')):
         return None
-    from gateway.session_kanban import record_worker_loss
+    from gateway.session_kanban import _loss_memory, record_worker_loss
     from gateway.session_runtime_workers import track_mutation
     # The owner's own state is part of the evidence: a loss taken during a drain/restart is the
     # restart's doing, and a run record that says so stops the next reader from blaming memory,
@@ -609,10 +690,16 @@ def _record_lost_attempt(authority, policy, exc, reason, scope):
                                          ('draining', '_draining'),
                                          ('external_drain', '_external_drain_active'))
              if getattr(authority, attr, False)}
-    return track_mutation(authority, asyncio.to_thread(partial(record_worker_loss, policy, reason,
-                                                               pid=(scope or {}).get('pid'),
-                                                               bound=scope is not None,
-                                                               owner=owner or None)))
+    pid = (scope or {}).get('pid')
+
+    def record():
+        # Order matters: the cgroup counters are read from /proc/<pid>/cgroup, and reading the
+        # wait status reaps the child (taking /proc/<pid> with it), so memory goes first.
+        memory = _loss_memory(pid)
+        state = worker.loss_state() if worker is not None else {}
+        record_worker_loss(policy, reason, pid=pid, bound=scope is not None,
+                           owner=owner or None, memory=memory, **state)
+    return track_mutation(authority, asyncio.to_thread(record))
 
 
 async def _settle_lost(authority, row, scope, recording):
@@ -815,9 +902,9 @@ async def execute_managed(authority, ref, row, policy):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
-            _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
+            _record_lost_attempt(authority, policy, exc, reason, scope, worker)  # nothing bound: a late note is dropped, never misbooked
             raise
-        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
+        await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope, worker))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
             live.controls.snapshot(ref.session_id, None)

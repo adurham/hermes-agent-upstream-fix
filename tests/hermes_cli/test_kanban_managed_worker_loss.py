@@ -441,3 +441,115 @@ def test_an_oom_kill_during_a_drain_is_still_the_cards_failure():
         {**planned, "memory": {"events": {"oom_kill": 0}}}) is True
     assert kanban_owner_recovery.planned_restart_loss(
         {**planned, "memory": {"events": {"oom_kill": 1}}}) is False
+
+
+# --- the loss must name a SIGNAL, not only the exception's class ---------------------------
+#
+# 2026-11-25: 81 losses read ``managed worker lost: EOFError`` and 80 named no cause at all.
+# At that instant the owner holds the child's wait status — the one field that separates
+# SIGKILL from exit 0 from its own SIGTERM, and the only thing that could name a silent
+# cross-lane kill (two sibling ``ps5-resident-guard-*`` units died ``status=9/KILL`` in the
+# same second as three worker EOFs, with no ``Stopping`` line and no kernel OOM).
+
+def test_the_run_note_names_the_signal_that_killed_the_worker(board):
+    run_id = board.running("t_signal", claim_expires_in=900, heartbeat_age=30,
+                           worker_lost="EOFError",
+                           loss_extra={"exit_status": -9, "owner_closed": False})
+    board.tick(failure_limit=2)
+    run = board.run(run_id)
+    assert run["outcome"] == "crashed"
+    assert "managed worker lost: EOFError" in run["error"]
+    assert "exit=SIGKILL(9)" in run["error"]
+    assert "owner_closed=False" in run["error"]
+    assert board.state("t_signal")["consecutive_failures"] == 1
+
+
+def test_an_oom_killed_worker_still_shows_the_signal_and_is_charged(board):
+    """The wait status adds to the cgroup counter; it never launders an OOM kill as a host fault."""
+    run_id = board.running("t_oom_sig", claim_expires_in=900, heartbeat_age=30,
+                           worker_lost="EOFError",
+                           loss_extra={"exit_status": -9, "owner_closed": False,
+                                       "memory": {"max": 6442450944, "peak": 6442450944,
+                                                  "events": {"oom_kill": 1}}})
+    board.tick(failure_limit=2)
+    run = board.run(run_id)
+    assert "oom_kill=1" in run["error"] and "exit=SIGKILL(9)" in run["error"]
+    assert board.state("t_oom_sig")["consecutive_failures"] == 1
+
+
+def test_a_loss_record_carries_the_wait_status_only_when_it_was_observed(board, monkeypatch):
+    from gateway import session_kanban
+    run_id = board.running("t_status", claim_expires_in=900, heartbeat_age=30)
+    policy = _owner_policy(board, "t_status", run_id)
+    monkeypatch.setattr(session_kanban, "_loss_memory", lambda pid: {})
+
+    session_kanban.record_worker_loss(policy, "EOFError", pid=4242, bound=True,
+                                      exit_status=-9, owner_closed=False)
+    session_kanban.record_worker_loss(policy, "EOFError", pid=4242, bound=True)
+
+    first, second = [json.loads(r[0]) for r in board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id='t_status' AND kind='worker_lost' ORDER BY id")]
+    assert (first["exit_status"], first["owner_closed"]) == (-9, False)
+    # "not observed" is not "exit 0": a caller that cannot read the status says nothing.
+    assert "exit_status" not in second and "owner_closed" not in second
+
+
+def _spawn_child(script: str):
+    """A real child that only sleeps: the wait status is the test's subject, not its work."""
+    import subprocess
+    import sys
+    return subprocess.Popen([sys.executable, '-c', script], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+@pytest.mark.asyncio
+async def test_a_sigkilled_worker_lands_its_signal_in_the_boards_loss_record(board):
+    """Through the gateway's real handler: the child is SIGKILLed and the board names it."""
+    from types import SimpleNamespace
+    from gateway.session_managed_worker import ManagedWorker, _record_lost_attempt
+    run_id = board.running("t_real_signal", claim_expires_in=900, heartbeat_age=30)
+    policy = _owner_policy(board, "t_real_signal", run_id)
+    child = _spawn_child('import time; time.sleep(60)')
+    worker = ManagedWorker(child)
+    try:
+        child.kill()
+        recording = _record_lost_attempt(SimpleNamespace(), policy, RuntimeError('EOFError'),
+                                         'EOFError', None, worker)
+        assert recording is not None
+        await recording
+    finally:
+        worker.close()
+    payload = json.loads(board.conn.execute(
+        "SELECT payload FROM task_events WHERE task_id='t_real_signal' AND kind='worker_lost' "
+        "ORDER BY id DESC LIMIT 1").fetchone()[0])
+    assert (payload["exit_status"], payload["owner_closed"]) == (-9, False)
+
+
+@pytest.mark.asyncio
+async def test_a_closed_worker_is_a_stop_and_never_a_lost_note(board):
+    """A close() with no Stop must read as our own teardown, which writes no loss note at all —
+    so the dispatcher can never book it as a crashed attempt."""
+    import asyncio
+    from types import SimpleNamespace
+    from gateway.session_managed_worker import ManagedWorker, _record_lost_attempt
+    from persistence.core.errors import AuthorityRefusal
+    from tests.waiting import async_wait_until
+    run_id = board.running("t_closed", claim_expires_in=900, heartbeat_age=30)
+    policy = _owner_policy(board, "t_closed", run_id)
+    child = _spawn_child('import time; time.sleep(300)')
+    worker = ManagedWorker(child)
+    try:
+        reading = asyncio.create_task(worker.next_frame(None, ack=5))
+        await async_wait_until(lambda: worker._requested, what="the reader parked on the pipe")
+        await asyncio.to_thread(worker.close)
+        with pytest.raises(AuthorityRefusal) as stopped:
+            await asyncio.wait_for(reading, timeout=30)
+        assert stopped.value.reason == 'managed_worker_stopped'
+        assert _record_lost_attempt(SimpleNamespace(), policy, stopped.value,
+                                    stopped.value.reason, None, worker) is None
+    finally:
+        worker.close()
+    count = board.conn.execute(
+        "SELECT count(*) FROM task_events WHERE task_id='t_closed' AND kind='worker_lost'").fetchone()[0]
+    assert count == 0
+

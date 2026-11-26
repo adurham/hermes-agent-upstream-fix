@@ -1,6 +1,7 @@
 """Read-only canonical admission fences for dispatcher reclaim paths."""
 import json
 from pathlib import Path
+import signal
 import time
 import psutil
 
@@ -298,14 +299,36 @@ def planned_restart_loss(lost) -> bool:
     return bool(owner.get("restart_requested") or owner.get("draining") or owner.get("external_drain"))
 
 
+def _exit_clause(status) -> str:
+    """``exit=SIGKILL(9)`` / ``exit=0`` / ``exit=running`` for a loss record's wait status.
+
+    A negative wait status is the SIGNAL that ended the child (``-9`` SIGKILL, ``-15`` SIGTERM),
+    a positive one its own exit code, and ``None`` a child that was still running when the owner
+    took the loss — the pipe closed without the process ending. This is the one field that names
+    a kill no other record names: ``EOFError`` cannot.
+    """
+    if status is None:
+        return "exit=running"
+    if not isinstance(status, int) or isinstance(status, bool):
+        return ""
+    if status < 0:
+        try:
+            name = signal.Signals(-status).name
+        except ValueError:
+            name = f"SIG{-status}"
+        return f"exit={name}({-status})"
+    return f"exit={status}"
+
+
 def loss_evidence(lost) -> str:
     """One bracketed clause naming what the loss record says BESIDES the exception's name.
 
     ``EOFError`` is a symptom. The same word covers a memcg OOM kill, a gateway restart and a
     genuine crash, and a reader who only has it will guess wrong (2026-11-17: a card blamed a
     4 GiB cap for four deaths that were `hermes update` restarts). The ``worker_lost`` payload
-    now carries the worker cgroup's counters and the planned-restart marker, so say them:
-    ``[oom_kill=0; cgroup peak 6.14 GiB of 6.00 GiB; planned restart 152s earlier]``.
+    now carries the worker cgroup's counters, the planned-restart marker and the child's wait
+    status, so say them:
+    ``[oom_kill=0; cgroup peak 6.14 GiB of 6.00 GiB; exit=SIGKILL(9); owner_closed=False]``.
     """
     if not isinstance(lost, dict):
         return ""
@@ -320,6 +343,12 @@ def loss_evidence(lost) -> str:
         peak, cap = _gib(memory.get("peak")), _gib(memory.get("max"))
         if peak:
             bits.append(f"cgroup peak {peak}" + (f" of {cap} cap" if cap else ""))
+    if "exit_status" in record:
+        clause = _exit_clause(record.get("exit_status"))
+        if clause:
+            bits.append(clause)
+    if isinstance(record.get("owner_closed"), bool):
+        bits.append(f"owner_closed={record['owner_closed']}")
     restart = record.get("planned_restart") if isinstance(record.get("planned_restart"), dict) else {}
     if restart:
         age = restart.get("age_s")
