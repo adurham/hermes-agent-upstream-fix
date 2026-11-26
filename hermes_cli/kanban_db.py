@@ -158,6 +158,8 @@ _DEFERRAL_RE = re.compile("|".join(re.escape(p) for p in DEFERRAL_PROSE))
 
 # Subject states recorded with a settlement.
 SUBJECT_PRESENT, SUBJECT_ABSENT, SUBJECT_NONE = "present", "absent", "no_subject"
+# A subject is named but no root was given to resolve a relative path against.
+SUBJECT_UNRESOLVED = "unresolved"
 
 # Path-shaped tokens a handoff's prose names (legacy rows have no recorded
 # subject). Kept to tree-relative roots so a summary mentioning a URL or a
@@ -372,23 +374,30 @@ def unsettled_greens(
             "subject_from": subject_from,
             "subject_state": row["subject_state"], "summary": _first_line(summary, 240),
         }
-        if item["subject_state"] is None and subject_path:
-            item["subject_state"] = (
-                SUBJECT_PRESENT if _resolve_subject(subject_path, root=root) else SUBJECT_ABSENT
+        # Re-measure only what we can resolve honestly: a relative path with no
+        # root would "read absent" purely because the CLI was run elsewhere.
+        raw_subject = str(item["subject_path"]).strip() if item["subject_path"] else ""
+        can_check = bool(
+            check_disk and raw_subject
+            and (root is not None or os.path.isabs(os.path.expanduser(raw_subject)))
+        )
+        if not can_check:
+            if item["subject_path"] and item["subject_state"] is None:
+                item["subject_state"] = SUBJECT_UNRESOLVED
+            out.append(item)
+            continue
+        resolved = _resolve_subject(item["subject_path"], root=root)
+        if resolved:
+            actual = _file_sha256(resolved)
+            item["subject_state"] = SUBJECT_PRESENT
+            item["subject_resolved"] = resolved
+            item["subject_sha256_actual"] = actual
+            item["sha_ok"] = (
+                bool(actual and item["subject_sha256"] and actual.startswith(item["subject_sha256"]))
+                if item["subject_sha256"] else None
             )
-        if check_disk and item["subject_path"]:
-            resolved = _resolve_subject(item["subject_path"], root=root)
-            if resolved:
-                actual = _file_sha256(resolved)
-                item["subject_state"] = SUBJECT_PRESENT
-                item["subject_resolved"] = resolved
-                item["subject_sha256_actual"] = actual
-                item["sha_ok"] = (
-                    bool(actual and item["subject_sha256"] and actual.startswith(item["subject_sha256"]))
-                    if item["subject_sha256"] else None
-                )
-            else:
-                item["subject_state"] = SUBJECT_ABSENT
+        else:
+            item["subject_state"] = SUBJECT_ABSENT
         out.append(item)
     return out
 

@@ -462,9 +462,12 @@ def _cmd_unsettled(args: argparse.Namespace) -> int:
     root = getattr(args, "root", None) or os.environ.get("KANBAN_LANE_ROOT")
     if not root:
         try:
-            root = (kb.read_board_metadata() or {}).get("default_workdir")
+            candidate = (kb.read_board_metadata() or {}).get("default_workdir")
         except Exception:
-            root = None
+            candidate = None
+        # A board can carry another host's workdir (lane boards are shared by
+        # path, not by mount): only trust a root that exists HERE.
+        root = candidate if candidate and os.path.isdir(os.path.expanduser(candidate)) else None
     with kbc.connect_closing() as conn:
         rows = kb.unsettled_greens(
             conn, days=days, check_disk=bool(getattr(args, "check", True)), root=root)
