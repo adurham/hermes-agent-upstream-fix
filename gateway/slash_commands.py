@@ -36,6 +36,44 @@ from hermes_cli._startup_fast import project_root_str
 
 logger = logging.getLogger("gateway.run")
 
+# Profiles that may never restart the host gateway, on top of the ``-pm`` suffix rule below.
+# A lane PM is a lane's OWN unattended agent: it commits to the checkout, it runs while nobody is
+# home, and when its restart's drain bound expires it force-stops every other lane's in-flight
+# work. Measured 2026-11-25: a ps5-pm agent committed at 18:29:11, requested a gateway restart ten
+# seconds later, and the 1800 s bound stopped 12 managed workers at 18:59 with the owner away.
+# Restarting the host is the owner's call -- `hermes gateway restart`, `hermes update`, or /restart
+# from the owner's own chat -- never a lane's.
+RESTART_DENIED_PROFILE_SUFFIX = "-pm"
+
+
+def gateway_restart_denied_profile(source: object) -> Optional[str]:
+    """The lane profile that may not restart this gateway, or ``None`` when the caller may.
+
+    Read from the identity pinned at ingress (``profile_routes`` re-homes an event to the profile
+    that executes it), falling back to ``source.profile``. Fails OPEN on an unresolved profile: the
+    transports that can reach a slash command without one are the owner's own, and a denial that
+    cannot name a profile would block the host's chat too.
+    """
+    profile = None
+    with contextlib.suppress(Exception):
+        from gateway.session_identity import identity_of
+        identity = identity_of(source)
+        if identity is not None:
+            profile = identity.runtime_profile
+    if not profile:
+        profile = getattr(source, "profile", None)
+    if not isinstance(profile, str) or not profile.strip():
+        return None
+    name = profile.strip()
+    if name.lower().endswith(RESTART_DENIED_PROFILE_SUFFIX):
+        return name
+    return None
+
+
+def _refused_lane_restart(profile: str, command: str) -> str:
+    return (f"✗ /{command} refused: '{profile}' is a lane profile and may never restart the host "
+            f"gateway. Ask the owner to run `hermes gateway restart` (or `hermes update`).")
+
 
 # /rollback result keys -> i18n line for files the safe restore left alone.
 _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits"),
@@ -586,6 +624,11 @@ class GatewaySlashCommandsMixin(
     async def _handle_restart_command(self, event: MessageEvent) -> str | EphemeralReply | None:
         """Handle /restart command - drain active work, then restart the gateway."""
         from gateway.run import _hermes_home
+        denied = gateway_restart_denied_profile(event.source)
+        if denied:
+            logger.warning("Refused /restart from lane profile '%s': a lane may never restart the "
+                           "host gateway", denied)
+            return _refused_lane_restart(denied, "restart")
         # Idempotency check: if the previous gateway process recorded this same /restart (platform +
         # update_id) and we see it *again*, it's a redelivery from PTB's graceful-shutdown get_updates
         # ACK failing on the way out. Ignoring it prevents a loop where every fresh gateway re-restarts.
@@ -1402,6 +1445,12 @@ class GatewaySlashCommandsMixin(
         from gateway.approval_actor import opener_authority
         from gateway.run import _hermes_home, _resolve_hermes_bin
         from hermes_cli.config import is_managed, format_managed_message
+        # An update restarts the gateway, so /update inherits /restart's lane refusal.
+        denied = gateway_restart_denied_profile(event.source)
+        if denied:
+            logger.warning("Refused /update from lane profile '%s': a lane may never restart the "
+                           "host gateway", denied)
+            return _refused_lane_restart(denied, "update")
         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
         # allow_update_command=True are also allowed.
         src = event.source
