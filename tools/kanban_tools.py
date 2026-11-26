@@ -370,6 +370,14 @@ def _redact_opt(value: Any) -> Any:
     return _redact(value) if value else value
 
 
+def _opt_lower(value: Any) -> Any:
+    """Stripped lowercase for a short enum-ish argument; None when empty."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
 def _redact_metadata(metadata: dict) -> dict:
     """Redact leaf-by-leaf: a whole-JSON pass can eat a string's closing quote and fail to re-parse."""
     from agent.redact_structured import redact_structured
@@ -758,6 +766,9 @@ def _handle_complete(args: dict, **kw) -> str:
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    settlement = _opt_lower(args.get("settlement"))
+    subject = _redact_opt(args.get("subject") or None)
+    subject_sha256 = _opt_lower(args.get("subject_sha256"))
     with _board(args.get("board")) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
@@ -767,7 +778,13 @@ def _handle_complete(args: dict, **kw) -> str:
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
-                created_cards=created_cards, expected_run_id=_worker_run_id(tid))
+                created_cards=created_cards, expected_run_id=_worker_run_id(tid),
+                settlement=settlement, subject=subject, subject_sha256=subject_sha256)
+        except kb.SettlementError as settle_err:
+            # Nothing was written: the handoff claims landed and the bytes say
+            # otherwise. Name both ways out so the model retries instead of
+            # treating the refusal as terminal.
+            return tool_error(f"kanban_complete refused: {settle_err}. Nothing changed.")
         except kb.ArtifactPreservationError as artifact_err:
             # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
@@ -903,6 +920,9 @@ def _handle_request_review(args: dict, **kw) -> str:
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    settlement = _opt_lower(args.get("settlement"))
+    subject = _redact_opt(args.get("subject") or None)
+    subject_sha256 = _opt_lower(args.get("subject_sha256"))
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)
     if reviewer:
@@ -918,7 +938,10 @@ def _handle_request_review(args: dict, **kw) -> str:
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid), with_reason=True)
+                expected_run_id=_worker_run_id(tid), with_reason=True,
+                settlement=settlement, subject=subject, subject_sha256=subject_sha256)
+        except kb.SettlementError as settle_err:
+            return tool_error(f"kanban_request_review refused: {settle_err}. Nothing changed.")
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
             # back, the task is untouched and retryable — say so explicitly or

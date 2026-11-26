@@ -160,6 +160,34 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "task in-flight so you can fix the path and retry."
             ),
         },
+        "settlement": {
+            "type": "string",
+            "enum": ["landed", "deferred"],
+            "description": (
+                "Machine-readable meaning of this completion, so a deferral is "
+                "never recorded as a settle. 'landed' = the subject was "
+                "verified on disk (name it in ``subject``). 'deferred' = the "
+                "handoff is recorded but the subject is NOT in the tree yet "
+                "(armed, parked, queued, waiting on a freeze/lease) — the card "
+                "still closes, but queries can tell it apart from a landing. "
+                "Omit only when the summary is unambiguous: prose that says "
+                "the subject is not in the tree / still armed / nothing was "
+                "written / not landed is recorded 'deferred' automatically, "
+                "and a 'landed' claim whose ``subject`` is absent is "
+                "downgraded to 'deferred' rather than trusted."
+            ),
+        },
+        "subject": _prop("string", (
+                "Optional path to the one artifact whose presence defines "
+                "this completion (absolute, or relative to your workspace). "
+                "Recorded with the settlement and re-checked by `hermes "
+                "kanban unsettled`; a landed claim naming an absent path is "
+                "recorded deferred."
+        )),
+        "subject_sha256": _prop("string", (
+                "Optional expected sha256 (8-64 hex chars) of ``subject``. A "
+                "mismatch refuses the completion with nothing written."
+        )),
     },
     [],
 )
@@ -265,6 +293,28 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "so you can fix the path and retry."
             ),
         },
+        "settlement": {
+            "type": "string",
+            "enum": ["landed", "deferred"],
+            "description": (
+                "Machine-readable meaning of this review handoff. 'landed' = "
+                "the subject is on disk now; 'deferred' = the implementation "
+                "is recorded but the bytes are NOT in the tree yet. Omitted, "
+                "it is derived from the summary's own words (a summary saying "
+                "not in the tree / still armed / nothing was written / not "
+                "landed records 'deferred'), and an absent ``subject`` "
+                "downgrades a landed claim. An approved review inherits the "
+                "implementer's deferred settlement."
+            ),
+        },
+        "subject": _prop("string", (
+                "Optional path to the one artifact whose presence defines "
+                "this handoff (absolute, or relative to your workspace)."
+        )),
+        "subject_sha256": _prop("string", (
+                "Optional expected sha256 (8-64 hex chars) of ``subject``; a "
+                "mismatch refuses the handoff with nothing written."
+        )),
     },
     ["summary"],
 )

@@ -127,6 +127,272 @@ CAPACITY_BLOCK_KINDS = frozenset({"parked_capacity"})
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# --- Settlement of a completion handoff -------------------------------------
+# ``status='done'`` has always carried two incompatible meanings: the subject was
+# verified on disk, or the unit is merely armed/deferred and nothing was written.
+# The only distinguishing evidence was the free text of ``task_runs.summary``, so
+# no query could tell a settle from a deferral (82 of 1061 greens in 14 days
+# asserted non-landing in prose only — t_d898441d). ``settlement`` makes that
+# machine-readable on the completion handoff:
+#   landed   — the subject was verified on disk (``subject_path`` present);
+#   deferred — the handoff is recorded, the bytes are not in the tree yet.
+# NULL = a pre-settlement row (legacy); ``unsettled_greens`` classifies those
+# from prose read-only, so no historical green has to be re-opened.
+VALID_SETTLEMENTS = ("landed", "deferred")
+
+# Phrases that assert the subject did NOT land. Deliberately narrow and literal:
+# a false positive only records ``deferred`` for a card that did land (the safe
+# direction for a presence query), while a false negative is at worst today's
+# behaviour. Matches the measured population; kept in sync with the census SQL
+# printed by ``hermes kanban unsettled``.
+DEFERRAL_PROSE = (
+    "not yet in the tree",
+    "nothing was written",
+    "still armed",
+    "not landed",
+    "not yet landed",
+    "not published by this run",
+    "no bytes on disk",
+)
+_DEFERRAL_RE = re.compile("|".join(re.escape(p) for p in DEFERRAL_PROSE))
+
+# Subject states recorded with a settlement.
+SUBJECT_PRESENT, SUBJECT_ABSENT, SUBJECT_NONE = "present", "absent", "no_subject"
+
+# Path-shaped tokens a handoff's prose names (legacy rows have no recorded
+# subject). Kept to tree-relative roots so a summary mentioning a URL or a
+# random dotted word does not become a "subject".
+_PROSE_PATH_RE = re.compile(
+    r"(?<![\w/.-])((?:work|tools|harness|state|deploy|tests|apps|docs|stubs)"
+    r"/[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)"
+)
+
+
+def subject_from_prose(text: Optional[str], root: Optional[str] = None) -> Optional[str]:
+    """Best-effort subject path named in a handoff summary (legacy rows only).
+
+    Read-only: the first path-shaped token wins when none resolves, so a row
+    whose bytes are gone still names what it was about."""
+    if not text:
+        return None
+    seen: list[str] = []
+    for match in _PROSE_PATH_RE.finditer(text):
+        path = match.group(1).rstrip(".,;:)'\"`")
+        if path not in seen:
+            seen.append(path)
+    for path in seen:
+        if _resolve_subject(path, root=root):
+            return path
+    return seen[0] if seen else None
+
+
+class SettlementError(ValueError):
+    """``complete_task``/``request_review`` refused: the handoff declares
+    ``settlement='landed'`` but contradicts the disk — the named ``subject`` is
+    absent, or its sha256 does not start with ``subject_sha256``. A
+    ``ValueError`` so tool error handlers treat it as recoverable: nothing was
+    written, and the caller can publish and retry, or declare ``deferred``."""
+
+    def __init__(self, task_id: str, detail: str):
+        self.task_id = task_id
+        super().__init__(
+            f"{task_id}: the handoff claims settlement='landed' but the subject "
+            f"does not verify — {detail}. Publish the bytes and retry, or declare "
+            f"settlement='deferred' (or kanban_block) so the deferral is recorded "
+            f"as a deferral instead of a settle"
+        )
+
+
+def settlement_from_prose(*texts: Optional[str]) -> Optional[str]:
+    """``"deferred"`` when the handoff's own words assert the subject did not
+    land, else ``None`` (the prose makes no such claim)."""
+    blob = " ".join(t for t in texts if t).lower()
+    return "deferred" if blob and _DEFERRAL_RE.search(blob) else None
+
+
+def _resolve_subject(path: str, workspace_path: Optional[str] = None,
+                     root: Optional[str] = None) -> Optional[str]:
+    """Absolute on-disk path for a handoff ``subject``, or None when it resolves
+    nowhere we can see. Tries the path as written (absolute or cwd-relative), the
+    card's own workspace, an explicit ``root``, and the lane roots named in the
+    environment."""
+    raw = os.path.expanduser(str(path).strip())
+    if not raw:
+        return None
+    candidates = [raw] if os.path.isabs(raw) else [os.path.abspath(raw)]
+    if not os.path.isabs(raw):
+        if workspace_path:
+            candidates.append(os.path.join(os.path.expanduser(workspace_path), raw))
+        if root:
+            candidates.append(os.path.join(os.path.expanduser(str(root)), raw))
+        for var in ("KANBAN_LANE_ROOT", "HERMES_KANBAN_LANE_ROOT"):
+            env_root = os.environ.get(var)
+            if env_root:
+                candidates.append(os.path.join(os.path.expanduser(env_root), raw))
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+def _file_sha256(path: str) -> Optional[str]:
+    try:
+        import hashlib
+
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _classify_settlement(
+    task_id: str, *, settlement: Optional[str], summary: Optional[str],
+    subject: Optional[str], subject_sha256: Optional[str],
+    workspace_path: Optional[str], metadata: Optional[dict] = None,
+) -> dict:
+    """Resolve the machine-readable settlement of a completion handoff.
+
+    Explicit ``settlement`` wins. When omitted it is derived from the handoff's
+    own prose (``settlement_from_prose``): a handoff that says the subject is not
+    in the tree is recorded ``deferred``, never as a green settle. A declared
+    ``landed`` is verified against ``subject``/``subject_sha256`` when given; a
+    contradiction raises :class:`SettlementError`, and a subject that resolves
+    nowhere downgrades the claim to ``deferred`` (never the other way round).
+
+    Returns ``{settlement, source, subject_path, subject_sha256, subject_state}``
+    where ``source`` is ``declared`` | ``prose`` | ``default`` | ``subject_absent``
+    | ``review_inherited``.
+    """
+    if settlement is not None:
+        settlement = str(settlement).strip().lower()
+        if settlement not in VALID_SETTLEMENTS:
+            raise ValueError(
+                f"settlement must be one of {list(VALID_SETTLEMENTS)} (got {settlement!r})"
+            )
+    subject = (str(subject).strip() or None) if subject is not None else None
+    if subject is None and isinstance(metadata, dict):
+        # A single declared artifact IS the subject: it was already required to
+        # exist at completion, so it is the natural thing to verify.
+        arts = metadata.get("artifacts")
+        if isinstance(arts, (list, tuple)) and len(arts) == 1 and isinstance(arts[0], str):
+            subject = arts[0].strip() or None
+    sha_claim = (str(subject_sha256).strip().lower() or None) if subject_sha256 else None
+    if sha_claim is not None and not re.fullmatch(r"[0-9a-f]{8,64}", sha_claim):
+        raise ValueError(
+            f"subject_sha256 must be 8-64 lowercase hex chars (got {subject_sha256!r})"
+        )
+
+    resolved = _resolve_subject(subject, workspace_path) if subject else None
+    state = SUBJECT_PRESENT if resolved else (SUBJECT_ABSENT if subject else SUBJECT_NONE)
+    if resolved and sha_claim:
+        actual = _file_sha256(resolved)
+        if actual is None or not actual.startswith(sha_claim):
+            raise SettlementError(
+                task_id,
+                f"{subject} resolves to {resolved} with sha256 "
+                f"{(actual or 'unreadable')[:16]}…, not {sha_claim}",
+            )
+
+    source = "declared"
+    if settlement is None:
+        settlement = settlement_from_prose(summary) or "landed"
+        source = "prose" if settlement == "deferred" else "default"
+    if settlement == "landed" and state == SUBJECT_ABSENT:
+        # The one contradiction a handoff cannot talk its way out of: it says
+        # landed and names bytes that are not there. Record the deferral the
+        # evidence supports instead of refusing (the bytes may land later).
+        settlement, source = "deferred", "subject_absent"
+    if settlement == "deferred" and subject is None:
+        # A deferral names what it is deferring: keep the subject the prose
+        # names so a later query can re-measure it, even when the caller passed
+        # none. Landed claims are never re-pointed this way (a passing mention
+        # of an already-cleaned scratch path must not downgrade a real landing).
+        inferred = subject_from_prose(summary)
+        if inferred:
+            subject = inferred
+            state = SUBJECT_PRESENT if _resolve_subject(subject, workspace_path) else SUBJECT_ABSENT
+    return {
+        "settlement": settlement,
+        "source": source,
+        "subject_path": subject,
+        "subject_sha256": sha_claim,
+        "subject_state": state,
+    }
+
+
+def unsettled_greens(
+    conn: sqlite3.Connection, *, days: int = 14, check_disk: bool = True,
+    root: Optional[str] = None,
+) -> list[dict]:
+    """Every ``done`` card in the window that is **not** a verified landing.
+
+    The one query the board could not answer before: a green whose subject is a
+    deferral, not a settle. Explicit ``settlement='deferred'`` rows are returned
+    as recorded; legacy rows (``settlement IS NULL``) are classified from their
+    closing run's prose, read-only, so no historical card is re-opened or
+    rewritten. With ``check_disk`` the recorded ``subject_path`` is re-measured
+    now, which separates "deferred and landed since" from "still absent".
+    """
+    cutoff = int(time.time()) - max(int(days), 0) * 86400
+    rows = conn.execute(
+        "SELECT id, title, status, completed_at, settlement, subject_path, "
+        "subject_sha256, subject_state FROM tasks "
+        "WHERE status='done' AND completed_at IS NOT NULL AND completed_at > ? "
+        "ORDER BY completed_at DESC",
+        (cutoff,),
+    ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        settlement = row["settlement"]
+        source = "recorded"
+        summary = ""
+        run = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id=? AND outcome='completed' "
+            "ORDER BY id DESC LIMIT 1", (row["id"],),
+        ).fetchone()
+        if run:
+            summary = run["summary"] or ""
+        if settlement is None:
+            if settlement_from_prose(summary) != "deferred":
+                continue
+            settlement, source = "deferred", "prose"
+        elif settlement != "deferred":
+            continue
+        subject_path = row["subject_path"]
+        subject_from = "recorded" if subject_path else None
+        if subject_path is None:
+            # Legacy row: the closing prose is the only evidence of what this
+            # green was about. Name it, but never write it back.
+            subject_path = subject_from_prose(summary, root=root)
+            subject_from = "prose" if subject_path else None
+        item = {
+            "id": row["id"], "title": row["title"], "completed_at": row["completed_at"],
+            "settlement": settlement, "source": source,
+            "subject_path": subject_path, "subject_sha256": row["subject_sha256"],
+            "subject_from": subject_from,
+            "subject_state": row["subject_state"], "summary": _first_line(summary, 240),
+        }
+        if item["subject_state"] is None and subject_path:
+            item["subject_state"] = (
+                SUBJECT_PRESENT if _resolve_subject(subject_path, root=root) else SUBJECT_ABSENT
+            )
+        if check_disk and item["subject_path"]:
+            resolved = _resolve_subject(item["subject_path"], root=root)
+            if resolved:
+                actual = _file_sha256(resolved)
+                item["subject_state"] = SUBJECT_PRESENT
+                item["subject_resolved"] = resolved
+                item["subject_sha256_actual"] = actual
+                item["sha_ok"] = (
+                    bool(actual and item["subject_sha256"] and actual.startswith(item["subject_sha256"]))
+                    if item["subject_sha256"] else None
+                )
+            else:
+                item["subject_state"] = SUBJECT_ABSENT
+        out.append(item)
+    return out
+
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -785,6 +1051,14 @@ class Task:
     # ``resume_capacity_parks`` returns this card to ``ready``.
     park_ceiling: Optional[int] = None
     completion_contract: Optional[str] = None
+    # Settlement of the closing handoff (see VALID_SETTLEMENTS): 'landed' = the
+    # subject was verified on disk, 'deferred' = recorded but not in the tree yet,
+    # NULL = a pre-settlement row. ``subject_state`` is 'present'|'absent'|
+    # 'no_subject' as measured at completion time.
+    settlement: Optional[str] = None
+    subject_path: Optional[str] = None
+    subject_sha256: Optional[str] = None
+    subject_state: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -820,6 +1094,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "settlement", "subject_path", "subject_sha256", "subject_state",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1571,6 +1846,14 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def _task_workspace_path(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The card's workspace directory, expanded, or None. Used to resolve a
+    relative handoff ``subject`` against the tree the worker actually wrote in."""
+    row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    path = row["workspace_path"] if row else None
+    return str(os.path.expanduser(path)) if path else None
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -2024,9 +2307,13 @@ def _append_event(
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    settlement: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task).
+
+    ``settlement`` records the handoff's machine-readable settlement on the run
+    (``landed`` | ``deferred``, see ``VALID_SETTLEMENTS``).
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -2044,12 +2331,14 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
+               settlement    = ?,
                ended_at      = ?,
                claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (status or outcome, outcome, summary, error, _json_or_null(metadata),
+         settlement, now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
@@ -2090,23 +2379,25 @@ _UNSET: Any = object()
 def _end_or_synthesize_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, status: str,
     summary: Optional[str] = None, metadata: Optional[dict] = None, synthesize: bool,
-    profile: Any = _UNSET,
+    profile: Any = _UNSET, settlement: Optional[str] = None,
 ) -> Optional[int]:
     """:func:`_end_run`; when no run was active and ``synthesize`` holds, record a
     zero-duration run instead so the handoff fields survive in attempt history.
     ``profile`` overrides the profile read off the task row for the synthesized
     run — transitions that reassign the task (e.g. review handoff) pass the
     acting profile captured before the rewrite."""
-    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary, metadata=metadata)
+    run_id = _end_run(conn, task_id, outcome=outcome, status=status, summary=summary,
+                      metadata=metadata, settlement=settlement)
     if run_id is None and synthesize:
-        run_id = _synthesize_ended_run(conn, task_id, outcome=outcome, summary=summary, metadata=metadata, profile=profile)
+        run_id = _synthesize_ended_run(conn, task_id, outcome=outcome, summary=summary,
+                                       metadata=metadata, profile=profile, settlement=settlement)
     return run_id
 
 
 def _synthesize_ended_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None,
-    profile: Any = _UNSET,
+    profile: Any = _UNSET, settlement: Optional[str] = None,
 ) -> int:
     """Zero-duration closed run for a terminal transition on a never-claimed
     task, so the handoff fields aren't silently dropped (``_end_run`` is a
@@ -2128,12 +2419,13 @@ def _synthesize_ended_run(
         INSERT INTO task_runs (
             task_id, profile, step_key,
             status, outcome,
-            summary, error, metadata,
+            summary, error, metadata, settlement,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, profile, step_key, outcome, outcome, summary, error, _json_or_null(metadata),
+            task_id, profile, step_key, outcome, outcome, summary, error,
+            _json_or_null(metadata), settlement,
             now, now,
         ),
     )
@@ -2816,6 +3108,8 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    settlement: Optional[str] = None, subject: Optional[str] = None,
+    subject_sha256: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2833,6 +3127,15 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    ``settlement`` makes the handoff's meaning machine-readable (see
+    ``VALID_SETTLEMENTS``): ``landed`` (the subject is on disk) or ``deferred``
+    (recorded, nothing written yet). Omitted, it is derived from the handoff's
+    own prose, and a ``landed`` claim naming an absent ``subject`` is recorded
+    ``deferred`` instead. A ``subject`` whose sha256 contradicts
+    ``subject_sha256`` raises :class:`SettlementError` before anything is
+    written. Approving a review handoff inherits the implementer's deferred
+    settlement when the approval adds no settlement of its own.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2845,6 +3148,11 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    settle = _classify_settlement(
+        task_id, settlement=settlement, summary=handoff_summary, subject=subject,
+        subject_sha256=subject_sha256,
+        workspace_path=(_task_workspace_path(conn, task_id)), metadata=metadata,
+    )
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2856,10 +3164,27 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, "
+            "settlement, subject_path, subject_sha256, subject_state "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        # Approving out of review: the implementer's deferral must not be
+        # overwritten by the reviewer's bare approval (which carries no claim at
+        # all). An explicit/derived settlement on THIS handoff still wins.
+        if (
+            prior_status == "review"
+            and settlement is None
+            and settle["source"] == "default"
+            and trow and trow["settlement"] == "deferred"
+        ):
+            settle = {
+                "settlement": "deferred", "source": "review_inherited",
+                "subject_path": trow["subject_path"],
+                "subject_sha256": trow["subject_sha256"],
+                "subject_state": trow["subject_state"],
+            }
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
@@ -2874,11 +3199,18 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       settlement   = ?,
+                       subject_path = ?,
+                       subject_sha256 = ?,
+                       subject_state = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
-        params: tuple = (result, now, task_id)
+        params: tuple = (
+            result, now, settle["settlement"], settle["subject_path"],
+            settle["subject_sha256"], settle["subject_state"], task_id,
+        )
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
@@ -2888,7 +3220,7 @@ def complete_task(
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
             conn, task_id, outcome="completed", status="done", summary=handoff_summary,
-            metadata=metadata,
+            metadata=metadata, settlement=settle["settlement"],
         )
         # Never-claimed task: synthesize a run so the handoff fields survive.
         if run_id is None and (summary or metadata or result or prior_status == "review"):
@@ -2897,14 +3229,16 @@ def complete_task(
                 synth_summary = _REVIEW_APPROVED_NOTE
                 synth_metadata = {"source_status": "review", "approval": "manual"}
             run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                conn, task_id, outcome="completed", summary=synth_summary,
+                metadata=synth_metadata, settlement=settle["settlement"],
             )
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            _completed_event_payload(result, event_summary, verified_cards, metadata,
+                                     settlement=settle),
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -3011,6 +3345,7 @@ def _cleaned_artifact_paths(metadata: Any) -> list[str]:
 
 def _completed_event_payload(
     result: Optional[str], event_summary: Optional[str], verified_cards: list[str], metadata: Any,
+    *, settlement: Optional[dict] = None,
 ) -> dict:
     """``completed`` event payload: first summary line (400 chars) so gateway
     notifiers / dashboard WS render without a second round-trip; verified
@@ -3027,6 +3362,14 @@ def _completed_event_payload(
     }
     if verified_cards:
         payload["verified_cards"] = verified_cards
+    if settlement:
+        # Machine-readable meaning of this green: a deferral recorded as a
+        # completion must never be indistinguishable from a verified landing.
+        payload["settlement"] = settlement.get("settlement")
+        payload["settlement_source"] = settlement.get("source")
+        if settlement.get("subject_path"):
+            payload["subject_path"] = settlement["subject_path"]
+            payload["subject_state"] = settlement.get("subject_state")
     if isinstance(metadata, dict):
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
@@ -3476,6 +3819,8 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    settlement: Optional[str] = None, subject: Optional[str] = None,
+    subject_sha256: Optional[str] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3484,6 +3829,11 @@ def request_review(
     re-review defaults to the latest ``changes_requested`` provenance. A live
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
+
+    ``settlement`` / ``subject`` / ``subject_sha256`` are recorded the same way
+    as on a completion (see :func:`complete_task`): a review handoff that says
+    the bytes are not in the tree is recorded ``deferred``, and a declared
+    ``landed`` claim is checked against the named subject.
 
     ``metadata["artifacts"]`` names the handoff's deliverable
     files; a review handoff is the last implementer transition, and the
@@ -3504,6 +3854,11 @@ def request_review(
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
     metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    settle = _classify_settlement(
+        task_id, settlement=settlement, summary=summary, subject=subject,
+        subject_sha256=subject_sha256,
+        workspace_path=_task_workspace_path(conn, task_id), metadata=metadata,
+    )
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
@@ -3565,12 +3920,19 @@ def request_review(
                    SET status        = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL
+                       worker_pid    = NULL,
+                       settlement    = ?,
+                       subject_path  = ?,
+                       subject_sha256 = ?,
+                       subject_state = ?
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + run_guard,
-                params,
+                (*(
+                    settle["settlement"], settle["subject_path"],
+                    settle["subject_sha256"], settle["subject_state"],
+                ), *params),
             )
             if cur.rowcount != 1:
                 return _ret(
@@ -3583,12 +3945,14 @@ def request_review(
             run_id = _end_or_synthesize_run(
                 conn, task_id, outcome="review_requested", status="review",
                 summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
-                profile=implementer,
+                profile=implementer, settlement=settle["settlement"],
             )
             payload: dict = {
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "settlement": settle["settlement"],
+                "settlement_source": settle["source"],
             }
             staged = _cleaned_artifact_paths(metadata)
             if staged:

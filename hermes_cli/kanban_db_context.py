@@ -182,6 +182,20 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
         age = _relative_age(done_ts, now)
         lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+        # A deferred handoff is recorded as a completion but its subject is not in
+        # the tree: say so before a child builds on it (t_d898441d). Legacy rows
+        # (no settlement column) are classified from the prose, read-only.
+        deferred = getattr(pt, "settlement", None) == "deferred"
+        if getattr(pt, "settlement", None) is None and run is not None:
+            deferred = _kb.settlement_from_prose(run.summary) == "deferred"
+        if deferred:
+            subject = getattr(pt, "subject_path", None)
+            lines.append(
+                "_Settlement: deferred — this handoff was recorded as a completion, "
+                "but its subject was NOT verified on disk"
+                + (f" ({subject})." if subject else ".")
+                + " Re-verify before building on it._"
+            )
         if run is not None and run.summary and run.summary.strip():
             lines.append(_ctx_cap(run.summary))
         elif pt.result:

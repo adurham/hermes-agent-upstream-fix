@@ -259,6 +259,17 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
+    _cmd("unsettled", [
+        _arg("--since", type=_nonnegative_int, default=14, metavar="DAYS",
+             help="Window in days over completed_at (default: 14)"),
+        _arg("--no-check", dest="check", action="store_false",
+             help="Do not re-measure recorded subject paths on disk (faster, no filesystem access)"),
+        _arg("--root",
+             help="Base directory that relative subject paths resolve against "
+                  "(default: $KANBAN_LANE_ROOT, then the board's default_workdir)"),
+        _json_flag(help="Emit JSON rows instead of the default table"),
+    ], help="List 'done' cards that are NOT verified landings (deferred handoffs, "
+            "including legacy rows whose closing prose asserts non-landing)"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
     _cmd("set-model", [
@@ -314,6 +325,14 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
+        _arg("--settlement", choices=list(kb.VALID_SETTLEMENTS),
+             help="Machine-readable meaning of the handoff: 'landed' (subject verified on "
+                  "disk) or 'deferred' (recorded, bytes not in the tree yet). Omitted, a "
+                  "summary that asserts non-landing is recorded deferred."),
+        _arg("--subject", help="Path whose presence defines this completion (verified; an "
+                               "absent subject turns a landed claim into deferred)."),
+        _arg("--subject-sha256", dest="subject_sha256",
+             help="Expected sha256 (8-64 hex) of --subject; a mismatch refuses the completion."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -362,6 +381,12 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
+        _arg("--settlement", choices=list(kb.VALID_SETTLEMENTS),
+             help="Machine-readable meaning of the handoff: 'landed' or 'deferred' "
+                  "(omitted: derived from the summary's own words)."),
+        _arg("--subject", help="Path whose presence defines this handoff/implementation."),
+        _arg("--subject-sha256", dest="subject_sha256",
+             help="Expected sha256 (8-64 hex) of --subject; a mismatch refuses the handoff."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),

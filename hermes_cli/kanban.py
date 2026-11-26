@@ -448,6 +448,51 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_unsettled(args: argparse.Namespace) -> int:
+    """Every done card in the window that is NOT a verified landing.
+
+    Answers, in one command, the question the board could not answer before
+    (t_d898441d): *which greens are deferrals?* Recorded settlements are read
+    straight off the tasks row; legacy rows are classified from their closing
+    run's prose, read-only. With the default ``--check`` the recorded subject
+    path is re-measured now, so "deferred and landed since" reads differently
+    from "still absent".
+    """
+    days = int(getattr(args, "since", 14) or 0)
+    root = getattr(args, "root", None) or os.environ.get("KANBAN_LANE_ROOT")
+    if not root:
+        try:
+            root = (kb.read_board_metadata() or {}).get("default_workdir")
+        except Exception:
+            root = None
+    with kbc.connect_closing() as conn:
+        rows = kb.unsettled_greens(
+            conn, days=days, check_disk=bool(getattr(args, "check", True)), root=root)
+    if _json_out(args, rows):
+        return 0
+    if not rows:
+        print(f"(no unsettled greens in the last {days}d — every done card is a verified landing)")
+        return 0
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = row.get("subject_state") or "no_subject"
+        counts[key] = counts.get(key, 0) + 1
+    print(f"{len(rows)} done card(s) in the last {days}d are NOT verified landings "
+          f"({_fmt_counts(counts)})" + (f"; subjects resolved against {root}" if root else ""))
+    for row in rows:
+        stamp = _fmt_ts(row.get("completed_at"))
+        subject = row.get("subject_path") or "-"
+        if row.get("subject_from") == "prose":
+            subject += " (from prose)"
+        sha = row.get("subject_sha256")
+        mark = ""
+        if sha and row.get("sha_ok") is False:
+            mark = f" (sha MISMATCH, live {str(row.get('subject_sha256_actual'))[:12]}…)"
+        print(f"{row['id']}  {stamp}  {row['settlement']}/{row['source']}  "
+              f"{row.get('subject_state') or 'no_subject'}  {subject}{mark}")
+    return 0
+
+
 def _print_diagnostics(diags, indent: str, *, with_kind: bool) -> None:
     """Shared human rendering for ``show`` and ``diagnostics`` (suggested actions only)."""
     sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
@@ -527,6 +572,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+    # A deferred settlement is the one status field that changes what "done"
+    # means: the card closed but its subject is not in the tree (t_d898441d).
+    if getattr(task, "settlement", None):
+        subject = getattr(task, "subject_path", None)
+        state = getattr(task, "subject_state", None) or "no_subject"
+        field("settled", f"{task.settlement} ({state})" + (f" @ {subject}" if subject else ""))
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
     from hermes_cli import kanban_diagnostics as kd
@@ -922,7 +973,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        settlement=getattr(args, "settlement", None),
+                                        subject=getattr(args, "subject", None),
+                                        subject_sha256=getattr(args, "subject_sha256", None))
+            except kb.SettlementError as settle_err:
+                fail_msg[tid] = (f"cannot complete {tid}: {settle_err}. Publish the bytes and "
+                                 f"retry, or pass --settlement deferred to record the deferral.")
+                return False
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -1091,7 +1149,10 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)),
+            with_reason=True, settlement=getattr(args, "settlement", None),
+            subject=getattr(args, "subject", None),
+            subject_sha256=getattr(args, "subject_sha256", None))
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
@@ -1391,6 +1452,7 @@ _HANDLERS = {
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
+    "unsettled": _cmd_unsettled,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "resume-capacity": _cmd_resume_capacity,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,

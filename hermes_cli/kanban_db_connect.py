@@ -888,6 +888,13 @@ _LATER_TASK_COLUMNS = (
     ("park_ceiling", "park_ceiling INTEGER"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Settlement of the closing handoff (VALID_SETTLEMENTS): 'landed' = subject
+    # verified on disk, 'deferred' = recorded but not in the tree yet. NULL =
+    # pre-settlement row; ``unsettled_greens`` classifies those from prose.
+    ("settlement", "settlement TEXT"),
+    ("subject_path", "subject_path TEXT"),
+    ("subject_sha256", "subject_sha256 TEXT"),
+    ("subject_state", "subject_state TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -909,6 +916,11 @@ _TASK_RUN_COLUMNS = (
     # Marker set by the terminal-worker reaper once it has ended (or found gone) the run's worker;
     # the pid itself is retained so a bound interpreter can still see it die. NULL = not yet reaped.
     ("worker_reaped_at", "worker_reaped_at INTEGER"),
+    # Settlement recorded on the closing handoff (VALID_SETTLEMENTS): 'landed' =
+    # the subject was verified on disk, 'deferred' = recorded but not in the tree
+    # yet. NULL = pre-settlement row. Mirrored onto tasks for cheap queries; the
+    # run row is the per-attempt evidence.
+    ("settlement", "settlement TEXT"),
 )
 
 

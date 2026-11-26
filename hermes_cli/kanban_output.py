@@ -19,6 +19,9 @@ _TASK_DICT_FIELDS = (
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
+    # Settlement of the closing handoff (landed | deferred | None) + the subject
+    # it named, so `list --json` / `show --json` can tell a settle from a deferral.
+    "settlement", "subject_path", "subject_sha256", "subject_state",
 )
 _SHOW_RUN_FIELDS = (
     "id", "profile", "step_key", "status", "outcome", "summary", "error",
